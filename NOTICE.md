@@ -23,9 +23,11 @@ the source - is GPL-3.0-or-later.
 
 Components under other licences, with their notices: `THIRD_PARTY_NOTICES.md`.
 
-## Clean-room statement
+## Origins
 
-This is an original implementation. It was written from the public description of Parapets' Auto Audio Switch
-(Nexus mod 134404) and from reading Skyrim's own audio code; no code, file or asset of that mod was read or used.
+Written for this project. The idea is Parapets' Auto Audio Switch (Nexus mod 134404), known here from its public
+description only; none of its files were read. The device-switch procedure - rebuilding the game's own audio engine on
+its audio thread and reviving each live sound - follows Live Audio Output Switching SE by Maarten Harms (MIT, notice
+in `THIRD_PARTY_NOTICES.md`), ported to three game versions.
 
 Source code: https://github.com/ApocryphaRealm/ApocryphaAutoAudioInputSwitch

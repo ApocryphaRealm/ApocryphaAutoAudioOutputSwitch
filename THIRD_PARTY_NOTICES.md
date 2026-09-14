@@ -37,3 +37,34 @@ MIT - the notice is `include/DevBench/DevBenchAPI.LICENSE.txt`, kept with the fi
 Not included. The plugin calls XAudio2_7.dll (installed with the DirectX End-User Runtime, which Skyrim requires) and the
 Windows MMDevice API at run time. `include/XAudio27.h` declares the XAudio2 2.7 interfaces from their published binary
 interface; it contains no Microsoft header text.
+
+## Live Audio Output Switching SE - the device-switch procedure
+
+https://github.com/maartenharms/live-audio-output-switching (v0.1.0) by Maarten Harms, MIT. The procedure in
+`source/AudioSwitch.cpp` - rebuild the game's own audio engine on its audio thread, detach and revive every live
+sound's voice, clear stale entries from the game's voice lists, and probe a new endpoint before using it - follows that
+project's 1.5.97 implementation, ported here to 1.5.97, AE 1.6.1170 and 1.7.x through Address Library IDs. Its
+licence notice:
+
+MIT License
+
+Copyright (c) 2026 Maarten Harms
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+

@@ -1,20 +1,24 @@
 #pragma once
 
-// Auto Audio Input Switch - own code, GPL-3.0-or-later (2026-09-13).
+// Auto Audio Input Switch - GPL-3.0-or-later (2026-09-13).
 //
-// How the game's audio is moved between devices without a restart, on every runtime (all use XAudio2 2.7):
+// How the game's audio moves to another device without a restart, on SE 1.5.97, AE 1.6.1170 and Skyrim 1.7.x (all
+// XAudio2 2.7):
 //
-//  * XAudio2_7.dll is pinned and the IXAudio2 COM vtable, shared by every engine instance, gets four slots
-//    patched: CreateMasteringVoice, CreateSubmixVoice, CreateSourceVoice and Release. No game address is used.
-//  * When an engine creates its mastering voice, the real one is created on the chosen device and a SUBMIX voice
-//    (processing stage 0x7FFFFFFF, sending only to the real one) is handed back in its place. In XAudio2 2.7 a
-//    mastering voice has no methods a submix voice lacks, so every voice the game creates sends to that stand-in.
-//    Voices created with the default send list are pointed at the stand-in explicitly.
-//  * A reset detaches the stand-in, destroys the real mastering voice, creates a new one on the target device and
-//    re-attaches the stand-in; after a critical error (the device vanished) the engine is started again. The game's
-//    own voices are never touched, so nothing it holds becomes invalid.
-//  * Resets are requested by Windows endpoint notifications (device added, removed, state changed, default changed),
-//    by the engine's critical-error callback and by the DevBench tool, debounced, and run on a worker thread.
+//  * XAudio2_7.dll is pinned (the game frees and reloads it on every rebuild) and the shared IXAudio2 vtable gets
+//    CreateMasteringVoice hooked (plus Initialize and GetDeviceCount for diagnostics). When the GAME creates its
+//    mastering voice, the device index is replaced by the switch target or the preferred device, and a device-loss
+//    callback is registered on that engine.
+//  * The game audio thread's call into its per-pass sound processing is hooked (found by its call target, so the
+//    instruction offset may differ per runtime). A switch runs there, between passes: every live sound's source voice
+//    is destroyed and nulled (the sounds stay), already-freed voices are cleared from the game's two voice lists, the
+//    game's OWN BSXAudio2Audio shutdown and init run (init builds a new engine and mastering voice on the target), and
+//    the game's own per-sound voice setup rebuilds each surviving sound. This procedure follows Live Audio Output
+//    Switching SE by Maarten Harms (MIT), which found it for 1.5.97; it is ported here through Address Library IDs.
+//  * A fresh engine is the only recovery XAudio2 2.7 allows after its device disappears, so an unplugged device, a
+//    Windows default change, a preferred device connecting and Switch now all take the same path. Decisions are made
+//    on a worker thread from Windows endpoint notifications and the engine's device-loss callback; a WASAPI render
+//    probe waits until a newly connected endpoint takes audio before switching to it.
 
 #include <cstdint>
 #include <string>

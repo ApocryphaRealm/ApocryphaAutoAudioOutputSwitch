@@ -1,4 +1,10 @@
-// Auto Audio Input Switch - own code, GPL-3.0-or-later (2026-09-13). The design is described in AudioSwitch.h.
+// Auto Audio Input Switch - GPL-3.0-or-later (2026-09-13).
+//
+// The device switch rebuilds the game's own audio engine on the game's audio thread. That procedure follows
+// Live Audio Output Switching SE by Maarten Harms (MIT; its notice is in THIRD_PARTY_NOTICES.md), which found it
+// for Skyrim SE 1.5.97. This file ports it to SE 1.5.97, AE 1.6.1170 and Skyrim 1.7.x through Address Library IDs
+// (each function and global confirmed in the 1.5.97 and 1.7.104 code), and adds the preferred device, the settings
+// page and the DevBench tool. See AudioSwitch.h.
 #include "PCH.h"
 
 #include "AudioSwitch.h"
@@ -10,6 +16,7 @@
 #include <Windows.h>
 #include <objbase.h>
 #include <mmdeviceapi.h>
+#include <audioclient.h>
 #include <functiondiscoverykeys_devpkey.h>
 
 #include <algorithm>
@@ -18,8 +25,8 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <cstring>
 #include <format>
-#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -31,9 +38,27 @@ namespace audioswitch
 	{
 		using namespace xa27;
 
-		// The stand-in submix sits after every voice the game can create (a voice may only send to a submix with a
-		// higher processing stage).
-		constexpr UINT32 kProxyStage = 0x7FFFFFFF;
+		// ---- game layout (identical on 1.5.97 and 1.7.104 in the disassembly) ----
+		constexpr std::uintptr_t kAudioMasterOff = 0x58;   // BSXAudio2Audio: IXAudio2MasteringVoice*
+		constexpr std::uintptr_t kSoundVoiceOff = 0x128;   // BSXAudio2GameSound: its source voice
+		constexpr std::uintptr_t kMgrMapCapacity = 0x34;   // BSAudioManager sound table: slot count
+		constexpr std::uintptr_t kMgrMapEntries = 0x50;    // BSAudioManager sound table: entry array
+		constexpr std::uintptr_t kEntryStride = 0x18;      // {key, sound* @+8, next @+0x10}; empty when next == 0
+		constexpr std::uintptr_t kVoiceListCount = 0x88;   // global voice list: count; data inline at +8 when flags < 0
+		constexpr int kSlotInit = 1;                       // BSXAudio2Audio vtable
+		constexpr int kSlotShutdown = 2;
+
+		struct GameAddresses
+		{
+			std::uintptr_t threadLoop{ 0 };     // BSAudioManagerThread run loop
+			std::uintptr_t processSounds{ 0 };  // the per-pass sound processing it calls
+			std::uintptr_t setupSound{ 0 };     // create + set up one sound's source voice (rcx = sound) -> bool
+			std::uintptr_t voiceListA{ 0 };
+			std::uintptr_t voiceListB{ 0 };
+			std::uintptr_t audioObject{ 0 };    // global BSXAudio2Audio*
+			std::uintptr_t audioVtable{ 0 };
+		};
+		GameAddresses g_addr;
 
 		std::string Narrow(const wchar_t* a_text)
 		{
@@ -42,6 +67,15 @@ namespace audioswitch
 			if (len <= 1) { return {}; }
 			std::string out(static_cast<std::size_t>(len - 1), '\0');
 			WideCharToMultiByte(CP_UTF8, 0, a_text, -1, out.data(), len, nullptr, nullptr);
+			return out;
+		}
+
+		std::wstring Widen(const std::string& a_text)
+		{
+			if (a_text.empty()) { return {}; }
+			const int len = MultiByteToWideChar(CP_UTF8, 0, a_text.c_str(), -1, nullptr, 0);
+			std::wstring out(static_cast<std::size_t>(len > 0 ? len - 1 : 0), L'\0');
+			if (len > 1) { MultiByteToWideChar(CP_UTF8, 0, a_text.c_str(), -1, out.data(), len); }
 			return out;
 		}
 
@@ -97,7 +131,167 @@ namespace audioswitch
 			}
 		}
 
-		thread_local int t_inside = 0;                    // > 0 while this plugin itself calls the original methods
+		// ---- SEH-guarded raw access (no C++ objects with destructors in these functions) ----
+		struct SehInfo
+		{
+			DWORD code{ 0 };
+			void* at{ nullptr };
+		};
+
+		int FillSeh(EXCEPTION_POINTERS* a_ep, SehInfo* a_out)
+		{
+			if (a_ep && a_ep->ExceptionRecord)
+			{
+				a_out->code = a_ep->ExceptionRecord->ExceptionCode;
+				a_out->at = a_ep->ExceptionRecord->ExceptionAddress;
+			}
+			return EXCEPTION_EXECUTE_HANDLER;
+		}
+
+		void* ReadPtr(void* a_base, std::uintptr_t a_off)
+		{
+			__try { return *reinterpret_cast<void**>(static_cast<std::uint8_t*>(a_base) + a_off); }
+			__except (EXCEPTION_EXECUTE_HANDLER) { return nullptr; }
+		}
+
+		void WritePtr(void* a_base, std::uintptr_t a_off, void* a_value)
+		{
+			__try { *reinterpret_cast<void**>(static_cast<std::uint8_t*>(a_base) + a_off) = a_value; }
+			__except (EXCEPTION_EXECUTE_HANDLER) {}
+		}
+
+		int CallGameSlot(void* a_object, int a_slot, SehInfo* a_seh)
+		{
+			__try
+			{
+				auto fn = reinterpret_cast<int (*)(void*)>((*reinterpret_cast<void***>(a_object))[a_slot]);
+				return fn(a_object);
+			}
+			__except (FillSeh(GetExceptionInformation(), a_seh)) { return -1; }
+		}
+
+		bool CallSetupSound(std::uintptr_t a_fn, void* a_sound)
+		{
+			__try { return reinterpret_cast<bool (*)(void*)>(a_fn)(a_sound); }
+			__except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+		}
+
+		void DestroyVoiceSafe(void* a_voice)
+		{
+			__try { static_cast<IXAudio2Voice*>(a_voice)->DestroyVoice(); }
+			__except (EXCEPTION_EXECUTE_HANDLER) {}
+		}
+
+		// The live game sounds, read from BSAudioManager's sound table. a_out receives up to a_max sound pointers.
+		int SnapshotSounds(void* a_mgr, void** a_out, int a_max)
+		{
+			int n = 0;
+			__try
+			{
+				const std::uint32_t capacity = *reinterpret_cast<std::uint32_t*>(static_cast<std::uint8_t*>(a_mgr) + kMgrMapCapacity);
+				auto* entries = *reinterpret_cast<std::uint8_t**>(static_cast<std::uint8_t*>(a_mgr) + kMgrMapEntries);
+				if (!entries || capacity == 0 || capacity > 0x10000) { return 0; }
+				for (std::uint32_t i = 0; i < capacity && n < a_max; ++i)
+				{
+					const std::uint8_t* e = entries + static_cast<std::size_t>(i) * kEntryStride;
+					if (*reinterpret_cast<void* const*>(e + 0x10) != nullptr)
+					{
+						if (void* s = *reinterpret_cast<void* const*>(e + 0x08)) { a_out[n++] = s; }
+					}
+				}
+			}
+			__except (EXCEPTION_EXECUTE_HANDLER) { n = 0; }
+			return n;
+		}
+
+		// Removes sounds from the table: every sound when a_onlyVoiceless is false, otherwise only sounds that have no
+		// source voice (so the game's per-sound update never dereferences a missing voice). Returns how many.
+		int RemoveSounds(void* a_mgr, bool a_onlyVoiceless)
+		{
+			int removed = 0;
+			__try
+			{
+				const std::uint32_t capacity = *reinterpret_cast<std::uint32_t*>(static_cast<std::uint8_t*>(a_mgr) + kMgrMapCapacity);
+				auto* entries = *reinterpret_cast<std::uint8_t**>(static_cast<std::uint8_t*>(a_mgr) + kMgrMapEntries);
+				if (!entries || capacity == 0 || capacity > 0x10000) { return 0; }
+				for (std::uint32_t i = 0; i < capacity; ++i)
+				{
+					std::uint8_t* e = entries + static_cast<std::size_t>(i) * kEntryStride;
+					if (*reinterpret_cast<void**>(e + 0x10) == nullptr) { continue; }
+					void* s = *reinterpret_cast<void**>(e + 0x08);
+					const bool voiceless = !s || *reinterpret_cast<void**>(static_cast<std::uint8_t*>(s) + kSoundVoiceOff) == nullptr;
+					if (!a_onlyVoiceless || voiceless)
+					{
+						*reinterpret_cast<void**>(e + 0x08) = nullptr;
+						*reinterpret_cast<void**>(e + 0x10) = nullptr;
+						++removed;
+					}
+				}
+			}
+			__except (EXCEPTION_EXECUTE_HANDLER) {}
+			return removed;
+		}
+
+		// A voice whose private implementation has no vtable was already freed; the game's shutdown would crash on it.
+		bool VoiceIsFreed(void* a_voice)
+		{
+			__try
+			{
+				void* impl = *reinterpret_cast<void**>(static_cast<std::uint8_t*>(a_voice) + 0x10);
+				return !impl || *reinterpret_cast<void**>(impl) == nullptr;
+			}
+			__except (EXCEPTION_EXECUTE_HANDLER) { return true; }
+		}
+
+		// Nulls entries of a global voice list whose voice was already freed, so the game's shutdown skips them.
+		int ScrubVoiceList(std::uintptr_t a_head)
+		{
+			int scrubbed = 0;
+			__try
+			{
+				auto* head = reinterpret_cast<std::uint8_t*>(a_head);
+				const std::int32_t flags = *reinterpret_cast<std::int32_t*>(head);
+				const std::uint32_t count = *reinterpret_cast<std::uint32_t*>(head + kVoiceListCount);
+				if (count == 0 || count > 0x4000) { return 0; }
+				auto* data = flags < 0 ? head + 8 : *reinterpret_cast<std::uint8_t**>(head + 8);
+				if (!data) { return 0; }
+				for (std::uint32_t i = 0; i < count; ++i)
+				{
+					std::uint8_t* entry = data + static_cast<std::size_t>(i) * 0x10;
+					void* voice = *reinterpret_cast<void**>(entry + 8);
+					if (voice && VoiceIsFreed(voice))
+					{
+						*reinterpret_cast<void**>(entry) = nullptr;
+						*reinterpret_cast<void**>(entry + 8) = nullptr;
+						++scrubbed;
+					}
+				}
+			}
+			__except (EXCEPTION_EXECUTE_HANDLER) {}
+			return scrubbed;
+		}
+
+		// ---- state ----
+		struct State
+		{
+			void* audio{ nullptr };             // BSXAudio2Audio
+			IXAudio2* engine{ nullptr };
+			IXAudio2Voice* master{ nullptr };
+			std::string deviceId;               // lower-case endpoint id
+			std::string deviceName;
+			UINT32 channels{ 0 };
+			UINT32 rate{ 0 };
+			std::uint32_t switches{ 0 };
+			std::uint32_t failures{ 0 };
+			std::string lastResult{ "waiting for the game's audio engine" };
+		};
+
+		std::mutex g_stateLock;
+		State g_state;
+		std::atomic<bool> g_critical{ false };
+		std::atomic<std::uint32_t> g_criticalCount{ 0 };
+		std::atomic<std::uint64_t> g_passes{ 0 };
+		thread_local int t_inside = 0;
 
 		struct Inside
 		{
@@ -105,182 +299,444 @@ namespace audioswitch
 			~Inside() { --t_inside; }
 		};
 
+		CreateMasteringFn g_origMaster{ nullptr };
+		InitializeFn g_origInitialize{ nullptr };
+		GetDeviceCountFn g_origDeviceCount{ nullptr };
+		using ProcessSoundsFn = void (*)(void*);
+		ProcessSoundsFn g_origProcessSounds{ nullptr };
+		std::atomic<bool> g_hooked{ false };
+		std::atomic<bool> g_threadHooked{ false };
+		std::atomic<std::uint32_t> g_initializeCalls{ 0 };
+		std::atomic<std::uint32_t> g_deviceCountCalls{ 0 };
+		std::string g_installResult{ "not run" };
+		std::string g_threadHookResult{ "not run" };
+
+		// swap handoff: the worker decides and waits; the audio thread performs
+		std::mutex g_swapLock;
+		std::condition_variable g_swapCv;
+		std::atomic<bool> g_swapPending{ false };
+		bool g_swapDone{ false };
+		std::string g_swapTargetId;  // lower-case endpoint id the new mastering voice must use (guarded by g_swapLock)
+
+		void SetResult(std::string a_text, bool a_failure = false)
+		{
+			std::scoped_lock l(g_stateLock);
+			g_state.lastResult = std::move(a_text);
+			if (a_failure) { ++g_state.failures; }
+		}
+
+		std::string LastResult()
+		{
+			std::scoped_lock l(g_stateLock);
+			return g_state.lastResult;
+		}
+
+		// ---- XAudio2 device list (only called with an engine the caller knows is alive) ----
 		struct Device
 		{
 			UINT32 index{ 0 };
-			std::string id;
+			std::string id;  // lower-case
 			std::string name;
 			UINT32 role{ 0 };
-			UINT32 channels{ 0 };
-			UINT32 rate{ 0 };
 		};
 
-		std::vector<Device> ListDevices(IXAudio2* a_engine, HRESULT& a_hr)
+		std::vector<Device> ListXaDevices(IXAudio2* a_engine)
 		{
 			std::vector<Device> out;
 			UINT32 count = 0;
+			HRESULT hr;
 			{
 				Inside inside;
-				a_hr = a_engine->GetDeviceCount(&count);
+				hr = a_engine->GetDeviceCount(&count);
 			}
-			if (FAILED(a_hr)) { return out; }
+			if (FAILED(hr)) { return out; }
 			for (UINT32 i = 0; i < count; ++i)
 			{
 				DeviceDetails details{};
-				const HRESULT hr = a_engine->GetDeviceDetails(i, &details);
-				if (FAILED(hr))
-				{
-					logger::debug("GetDeviceDetails({}) failed: {}", i, Hr(hr));
-					continue;
-				}
+				if (FAILED(a_engine->GetDeviceDetails(i, &details))) { continue; }
 				details.DeviceID[255] = L'\0';
 				details.DisplayName[255] = L'\0';
-				out.push_back({ i, Narrow(details.DeviceID), Narrow(details.DisplayName), details.Role,
-								details.OutputFormat.Format.nChannels, details.OutputFormat.Format.nSamplesPerSec });
+				out.push_back({ i, Lower(Narrow(details.DeviceID)), Narrow(details.DisplayName), details.Role });
 			}
 			return out;
 		}
 
-		void LogDevices(const std::vector<Device>& a_devices, HRESULT a_hr, std::string_view a_when)
+		// ---- Windows endpoints (safe whether or not the engine is alive) ----
+		struct Endpoint
 		{
-			if (FAILED(a_hr)) { logger::warn("{}: XAudio2 could not list output devices ({})", a_when, Hr(a_hr)); }
-			logger::debug("{}: XAudio2 lists {} output device(s)", a_when, a_devices.size());
-			for (const auto& d : a_devices)
+			std::string id;  // lower-case
+			std::string name;
+			DWORD state{ 0 };
+			bool isDefault{ false };
+		};
+
+		std::vector<Endpoint> ListEndpoints(bool a_activeOnly)
+		{
+			std::vector<Endpoint> out;
+			const HRESULT co = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+			IMMDeviceEnumerator* enumerator = nullptr;
+			if (SUCCEEDED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL, __uuidof(IMMDeviceEnumerator), reinterpret_cast<void**>(&enumerator))) && enumerator)
 			{
-				logger::debug("  [{}] \"{}\" role=0x{:X}{} channels={} rate={} id={}", d.index, d.name, d.role,
-							  (d.role & kDefaultGameDevice) ? " (Windows default)" : "", d.channels, d.rate, d.id);
+				std::string defaultId;
+				IMMDevice* def = nullptr;
+				if (SUCCEEDED(enumerator->GetDefaultAudioEndpoint(eRender, eConsole, &def)) && def)
+				{
+					LPWSTR id = nullptr;
+					if (SUCCEEDED(def->GetId(&id)) && id)
+					{
+						defaultId = Lower(Narrow(id));
+						CoTaskMemFree(id);
+					}
+					def->Release();
+				}
+				IMMDeviceCollection* collection = nullptr;
+				const DWORD mask = a_activeOnly ? DEVICE_STATE_ACTIVE : (DEVICE_STATE_ACTIVE | DEVICE_STATE_UNPLUGGED | DEVICE_STATE_DISABLED);
+				if (SUCCEEDED(enumerator->EnumAudioEndpoints(eRender, mask, &collection)) && collection)
+				{
+					UINT count = 0;
+					collection->GetCount(&count);
+					for (UINT i = 0; i < count; ++i)
+					{
+						IMMDevice* device = nullptr;
+						if (FAILED(collection->Item(i, &device)) || !device) { continue; }
+						Endpoint ep;
+						LPWSTR rawId = nullptr;
+						if (SUCCEEDED(device->GetId(&rawId)) && rawId)
+						{
+							ep.id = Lower(Narrow(rawId));
+							CoTaskMemFree(rawId);
+						}
+						device->GetState(&ep.state);
+						IPropertyStore* store = nullptr;
+						if (SUCCEEDED(device->OpenPropertyStore(STGM_READ, &store)) && store)
+						{
+							PROPVARIANT value;
+							PropVariantInit(&value);
+							if (SUCCEEDED(store->GetValue(PKEY_Device_FriendlyName, &value)) && value.vt == VT_LPWSTR) { ep.name = Narrow(value.pwszVal); }
+							PropVariantClear(&value);
+							store->Release();
+						}
+						device->Release();
+						ep.isDefault = !defaultId.empty() && ep.id == defaultId;
+						out.push_back(std::move(ep));
+					}
+					collection->Release();
+				}
+				enumerator->Release();
 			}
+			if (SUCCEEDED(co)) { CoUninitialize(); }
+			return out;
 		}
 
-		// sPreferredDevice: a full device id, or part of a device name (case-insensitive). Empty = none.
-		const Device* PreferredMatch(const std::vector<Device>& a_devices)
+		// sPreferredDevice: a full endpoint id, or part of a device name (case-insensitive). Empty = none.
+		const Endpoint* PreferredEndpoint(const std::vector<Endpoint>& a_list)
 		{
 			const std::string pref = Lower(Trim(settings::GetPreferredDevice()));
 			if (pref.empty()) { return nullptr; }
-			for (const auto& d : a_devices) { if (Lower(d.id) == pref) { return &d; } }
-			for (const auto& d : a_devices) { if (Lower(d.name).find(pref) != std::string::npos) { return &d; } }
+			for (const auto& e : a_list) { if (e.id == pref) { return &e; } }
+			for (const auto& e : a_list) { if (Lower(e.name).find(pref) != std::string::npos) { return &e; } }
 			return nullptr;
 		}
 
-		const Device* DefaultDevice(const std::vector<Device>& a_devices)
+		// A newly connected endpoint (Bluetooth especially) can report ACTIVE before its stream takes buffers; an
+		// XAudio2 2.7 mastering voice created then crashes the mixer. A shared-mode WASAPI render probe proves it is
+		// ready and warms it up. (Technique from Live Audio Output Switching SE, MIT.)
+		bool EndpointReady(const std::string& a_id)
 		{
-			for (const auto& d : a_devices) { if (d.role & kDefaultGameDevice) { return &d; } }
-			return a_devices.empty() ? nullptr : &a_devices.front();
+			if (a_id.empty()) { return true; }
+			const HRESULT co = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+			bool ok = false;
+			IMMDeviceEnumerator* enumerator = nullptr;
+			if (SUCCEEDED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL, __uuidof(IMMDeviceEnumerator), reinterpret_cast<void**>(&enumerator))) && enumerator)
+			{
+				IMMDevice* device = nullptr;
+				const std::wstring wid = Widen(a_id);
+				if (SUCCEEDED(enumerator->GetDevice(wid.c_str(), &device)) && device)
+				{
+					DWORD state = 0;
+					if (SUCCEEDED(device->GetState(&state)) && state == DEVICE_STATE_ACTIVE)
+					{
+						IAudioClient* client = nullptr;
+						if (SUCCEEDED(device->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, reinterpret_cast<void**>(&client))) && client)
+						{
+							WAVEFORMATEX* format = nullptr;
+							if (SUCCEEDED(client->GetMixFormat(&format)) && format)
+							{
+								if (SUCCEEDED(client->Initialize(AUDCLNT_SHAREMODE_SHARED, 0, 1000000, 0, format, nullptr)))
+								{
+									IAudioRenderClient* render = nullptr;
+									if (SUCCEEDED(client->GetService(__uuidof(IAudioRenderClient), reinterpret_cast<void**>(&render))) && render)
+									{
+										BYTE* buffer = nullptr;
+										if (SUCCEEDED(render->GetBuffer(64, &buffer)) && buffer)
+										{
+											render->ReleaseBuffer(0, 0);
+											ok = true;
+										}
+										render->Release();
+									}
+								}
+								CoTaskMemFree(format);
+							}
+							client->Release();
+						}
+					}
+					device->Release();
+				}
+				enumerator->Release();
+			}
+			else
+			{
+				ok = true;  // cannot probe: do not block the switch
+			}
+			if (SUCCEEDED(co)) { CoUninitialize(); }
+			return ok;
 		}
 
-		class EngineCallback;
-
-		struct Engine
-		{
-			std::uint64_t serial{ 0 };
-			IXAudio2* engine{ nullptr };
-			IXAudio2Voice* master{ nullptr };  // the real mastering voice; null while no device is attached
-			IXAudio2Voice* proxy{ nullptr };   // the submix the game holds as its mastering voice
-			UINT32 reqChannels{ 0 };
-			UINT32 reqRate{ 0 };
-			UINT32 reqFlags{ 0 };
-			UINT32 gameIndex{ 0 };
-			UINT32 proxyChannels{ 0 };
-			UINT32 proxyRate{ 0 };
-			std::string deviceId;
-			std::string deviceName;
-			EngineCallback* callback{ nullptr };
-			std::atomic<bool> critical{ false };
-			std::atomic<std::uint32_t> criticalCount{ 0 };
-			std::atomic<std::int32_t> lastCriticalHr{ 0 };
-			std::atomic<std::uint64_t> passes{ 0 };
-			std::uint32_t resets{ 0 };
-			std::string lastResult{ "created" };
-			std::chrono::steady_clock::time_point lastSwapAt{};
-		};
-
+		// ---- engine callback: an unplugged device kills the engine; turn that into a rebuild ----
 		class EngineCallback final : public IXAudio2EngineCallback
 		{
 		public:
-			explicit EngineCallback(Engine* a_engine) :
-				_engine(a_engine)
-			{}
-
 			void STDMETHODCALLTYPE OnProcessingPassStart() override {}
-
-			void STDMETHODCALLTYPE OnProcessingPassEnd() override { _engine->passes.fetch_add(1, std::memory_order_relaxed); }
-
-			// XAudio2's own thread: record and wake the worker, nothing else (no XAudio2 calls, no logging).
-			void STDMETHODCALLTYPE OnCriticalError(HRESULT a_error) override
+			void STDMETHODCALLTYPE OnProcessingPassEnd() override { g_passes.fetch_add(1, std::memory_order_relaxed); }
+			void STDMETHODCALLTYPE OnCriticalError(HRESULT) override
 			{
-				_engine->lastCriticalHr = static_cast<std::int32_t>(a_error);
-				_engine->criticalCount.fetch_add(1);
-				_engine->critical = true;
-				RequestReset("the audio engine reported a critical error (its device stopped working)", false);
+				g_criticalCount.fetch_add(1);
+				g_critical = true;
+				RequestReset("the audio engine lost its device", false, true);
+			}
+		};
+		EngineCallback g_callback;
+
+		bool IsGameAudioObject(void* a_candidate)
+		{
+			return a_candidate && g_addr.audioVtable && ReadPtr(a_candidate, 0) == reinterpret_cast<void*>(g_addr.audioVtable);
+		}
+
+		void* GameAudioObject()
+		{
+			if (!g_addr.audioObject) { return nullptr; }
+			void* object = ReadPtr(reinterpret_cast<void*>(g_addr.audioObject), 0);
+			return IsGameAudioObject(object) ? object : nullptr;
+		}
+
+		// ---- hooks ----
+		HRESULT STDMETHODCALLTYPE HookInitialize(IXAudio2* a_this, UINT32 a_flags, UINT32 a_processor)
+		{
+			const HRESULT hr = g_origInitialize(a_this, a_flags, a_processor);
+			if (t_inside == 0)
+			{
+				const auto n = g_initializeCalls.fetch_add(1) + 1;
+				logger::info("engine {} initialised (flags=0x{:X}): {} - call {}", Ptr(a_this), a_flags, Hr(hr), n);
+			}
+			return hr;
+		}
+
+		HRESULT STDMETHODCALLTYPE HookGetDeviceCount(IXAudio2* a_this, UINT32* a_count)
+		{
+			const HRESULT hr = g_origDeviceCount(a_this, a_count);
+			if (t_inside == 0 && g_deviceCountCalls.fetch_add(1) < 8)
+			{
+				logger::info("engine {} asked for its device count: {} device(s) ({})", Ptr(a_this), a_count ? *a_count : 0u, Hr(hr));
+			}
+			return hr;
+		}
+
+		HRESULT STDMETHODCALLTYPE HookCreateMastering(IXAudio2* a_this, IXAudio2Voice** a_out, UINT32 a_channels, UINT32 a_rate, UINT32 a_flags, UINT32 a_index, void* a_chain)
+		{
+			// Only the game's own call is managed: it passes &BSXAudio2Audio::masteringVoice (+0x58) as the out pointer.
+			void* object = a_out ? static_cast<void*>(reinterpret_cast<std::uint8_t*>(a_out) - kAudioMasterOff) : nullptr;
+			if (t_inside > 0 || !IsGameAudioObject(object))
+			{
+				return g_origMaster(a_this, a_out, a_channels, a_rate, a_flags, a_index, a_chain);
 			}
 
-		private:
-			Engine* _engine;
-		};
+			const auto devices = ListXaDevices(a_this);
+			logger::debug("the game creates its mastering voice: channels={} rate={} device index={}; XAudio2 lists {} device(s)", a_channels, a_rate, a_index, devices.size());
+			for (const auto& d : devices) { logger::debug("  [{}] \"{}\" role=0x{:X} id={}", d.index, d.name, d.role, d.id); }
 
-		std::recursive_mutex g_lock;                      // guards g_engines and every call that changes a voice graph
-		std::vector<std::unique_ptr<Engine>> g_engines;
-		std::atomic<std::uint64_t> g_nextSerial{ 1 };
+			std::string target;
+			{
+				std::scoped_lock l(g_swapLock);
+				target = g_swapTargetId;
+			}
+			UINT32 pick = a_index;
+			std::string why = "the game's choice (the Windows default device)";
+			if (settings::general::enabled)
+			{
+				const Device* chosen = nullptr;
+				if (!target.empty())
+				{
+					for (const auto& d : devices) { if (d.id == target) { chosen = &d; } }
+					if (chosen) { why = "the switch target"; }
+				}
+				if (!chosen)
+				{
+					const std::string pref = Lower(Trim(settings::GetPreferredDevice()));
+					if (!pref.empty())
+					{
+						for (const auto& d : devices) { if (!chosen && (d.id == pref || Lower(d.name).find(pref) != std::string::npos)) { chosen = &d; } }
+						if (chosen) { why = "the preferred device"; }
+					}
+				}
+				if (chosen) { pick = chosen->index; }
+			}
 
-		ReleaseFn g_origRelease{ nullptr };
-		CreateSourceFn g_origSource{ nullptr };
-		CreateSubmixFn g_origSubmix{ nullptr };
-		CreateMasteringFn g_origMaster{ nullptr };
-		DestroyVoiceFn g_origSubmixDestroy{ nullptr };
-		InitializeFn g_origInitialize{ nullptr };
-		GetDeviceCountFn g_origDeviceCount{ nullptr };
-		std::atomic<std::uint32_t> g_initializeCalls{ 0 };
-		std::atomic<std::uint32_t> g_deviceCountCalls{ 0 };
-		std::atomic<bool> g_hooked{ false };
-		std::atomic<bool> g_destroyHooked{ false };
-		std::atomic<std::uint32_t> g_redirectedSources{ 0 };
-		std::atomic<std::uint32_t> g_redirectedSubmixes{ 0 };
-		std::string g_installResult{ "not run" };          // written once at load, before any other thread exists
+			HRESULT hr = g_origMaster(a_this, a_out, a_channels, a_rate, a_flags, pick, a_chain);
+			if (FAILED(hr) && pick != a_index)
+			{
+				logger::warn("device index {} refused a mastering voice ({}); using the game's choice", pick, Hr(hr));
+				pick = a_index;
+				why = "the game's choice (the chosen device refused)";
+				hr = g_origMaster(a_this, a_out, a_channels, a_rate, a_flags, pick, a_chain);
+			}
+			if (FAILED(hr) || !*a_out)
+			{
+				logger::error("the game's mastering voice could not be created ({}): no usable output device", Hr(hr));
+				std::scoped_lock l(g_stateLock);
+				g_state.audio = object;
+				g_state.engine = a_this;
+				g_state.master = nullptr;
+				g_state.deviceId.clear();
+				g_state.deviceName.clear();
+				return hr;
+			}
 
-		std::mutex g_wakeLock;                            // guards the fields below
-		std::condition_variable g_wakeCv;
-		bool g_pending{ false };
-		bool g_force{ false };
-		bool g_urgent{ false };
-		std::string g_avoidId;
-		std::chrono::steady_clock::time_point g_urgentAt{};
-		bool g_busy{ false };
-		std::string g_pendingReason;
-		std::string g_lastReason{ "none" };
-		std::string g_watcherResult{ "not started" };
-		std::chrono::steady_clock::time_point g_lastEvent{};
-		std::uint32_t g_requests{ 0 };
-		std::uint32_t g_runs{ 0 };
-
-		std::mutex g_currentLock;
-		std::string g_currentId;  // lower-case id of the device the first engine plays on
-
-		void SetCurrentId(const std::string& a_id)
-		{
-			std::scoped_lock l(g_currentLock);
-			g_currentId = Lower(a_id);
+			const HRESULT cb = a_this->RegisterForCallbacks(&g_callback);
+			g_critical = false;
+			std::string name, id;
+			for (const auto& d : devices)
+			{
+				if (d.index == pick)
+				{
+					name = d.name;
+					id = d.id;
+				}
+			}
+			{
+				std::scoped_lock l(g_stateLock);
+				g_state.audio = object;
+				g_state.engine = a_this;
+				g_state.master = *a_out;
+				g_state.deviceId = id;
+				g_state.deviceName = name;
+				g_state.channels = a_channels;
+				g_state.rate = a_rate;
+			}
+			logger::info("the game's output is on [{}] \"{}\" ({}); engine {}, mastering voice {}, device-loss callback {}", pick, name, why, Ptr(a_this), Ptr(*a_out), Hr(cb));
+			return hr;
 		}
 
-		bool IsCurrentDevice(const std::string& a_id)
+		// ---- the switch, on the game's audio thread ----
+		void FinishSwap()
 		{
-			std::scoped_lock l(g_currentLock);
-			return !g_currentId.empty() && g_currentId == Lower(a_id);
+			{
+				std::scoped_lock l(g_swapLock);
+				g_swapDone = true;
+				g_swapTargetId.clear();
+			}
+			g_swapCv.notify_all();
 		}
 
-		Engine* FindEngine(IXAudio2* a_engine)
+		void FailSwap(std::string a_text)
 		{
-			for (auto& e : g_engines) { if (e->engine == a_engine) { return e.get(); } }
-			return nullptr;
+			logger::error("{}", a_text);
+			SetResult(std::move(a_text), true);
+			FinishSwap();
+		}
+
+		void PerformSwap()
+		{
+			const auto start = std::chrono::steady_clock::now();
+			void* audio = GameAudioObject();
+			auto* mgr = RE::BSAudioManager::GetSingleton();
+			if (!audio || !mgr)
+			{
+				FailSwap(std::format("switch skipped: the game's audio object {} or manager {} is not available", Ptr(audio), Ptr(mgr)));
+				return;
+			}
+			std::string from;
+			{
+				std::scoped_lock l(g_stateLock);
+				from = g_state.deviceName.empty() ? std::string("(no device)") : g_state.deviceName;
+			}
+
+			// 1. every live sound drops its source voice (destroyed while the engine still exists); the sound stays
+			static void* sounds[2048];
+			const int soundCount = SnapshotSounds(mgr, sounds, 2048);
+			int detached = 0;
+			for (int i = 0; i < soundCount; ++i)
+			{
+				if (void* voice = ReadPtr(sounds[i], kSoundVoiceOff))
+				{
+					DestroyVoiceSafe(voice);
+					WritePtr(sounds[i], kSoundVoiceOff, nullptr);
+					++detached;
+				}
+			}
+
+			// 2. already-freed voices left in the game's own voice lists would crash its shutdown
+			const int scrubbed = ScrubVoiceList(g_addr.voiceListA) + ScrubVoiceList(g_addr.voiceListB);
+
+			// 3. the game's own shutdown and init; init creates the mastering voice through our hook on the target
+			SehInfo seh{};
+			CallGameSlot(audio, kSlotShutdown, &seh);
+			{
+				std::scoped_lock l(g_stateLock);
+				g_state.engine = nullptr;
+				g_state.master = nullptr;
+			}
+			if (seh.code)
+			{
+				RemoveSounds(mgr, false);
+				FailSwap(std::format("switch failed: the game's audio shutdown faulted (0x{:08X}); sounds were dropped", seh.code));
+				return;
+			}
+			const int initResult = CallGameSlot(audio, kSlotInit, &seh);
+			if (seh.code)
+			{
+				RemoveSounds(mgr, false);
+				FailSwap(std::format("switch failed: the game's audio init faulted (0x{:08X}); sounds were dropped", seh.code));
+				return;
+			}
+			if (!ReadPtr(audio, kAudioMasterOff))
+			{
+				const int dropped = RemoveSounds(mgr, false);
+				FailSwap(std::format("no device accepted the rebuilt audio (was \"{}\"); {} sound(s) dropped; waiting for a device", from, dropped));
+				return;
+			}
+
+			// 4. the game's own per-sound voice setup rebuilds every surviving sound on the new engine
+			int revived = 0;
+			int failed = 0;
+			for (int i = 0; i < soundCount; ++i)
+			{
+				if (ReadPtr(sounds[i], kSoundVoiceOff)) { ++revived; continue; }
+				if (CallSetupSound(g_addr.setupSound, sounds[i]) && ReadPtr(sounds[i], kSoundVoiceOff)) { ++revived; }
+				else { ++failed; }
+			}
+			const int removed = RemoveSounds(mgr, true);
+			const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
+			{
+				std::scoped_lock l(g_stateLock);
+				++g_state.switches;
+				g_state.lastResult = std::format("switched \"{}\" -> \"{}\" in {} ms: {} sound(s) revived, {} failed, {} removed; {} voice(s) detached, {} stale list entr{} cleared, init {}",
+					from, g_state.deviceName, ms, revived, failed, removed, detached, scrubbed, scrubbed == 1 ? "y" : "ies", initResult);
+				logger::info("{}", g_state.lastResult);
+			}
+			FinishSwap();
+		}
+
+		void HookProcessSounds(void* a_manager)
+		{
+			if (g_swapPending.exchange(false)) { PerformSwap(); }
+			g_origProcessSounds(a_manager);
 		}
 
 		bool PatchSlot(void** a_vtable, std::size_t a_slot, void* a_hook, void** a_original, const char* a_name)
 		{
 			void** entry = a_vtable + a_slot;
-			if (*entry == a_hook)
-			{
-				logger::debug("{} is already hooked", a_name);
-				return true;
-			}
+			if (*entry == a_hook) { return true; }
 			DWORD old = 0;
 			if (!VirtualProtect(entry, sizeof(void*), PAGE_READWRITE, &old))
 			{
@@ -290,388 +746,142 @@ namespace audioswitch
 			*a_original = *entry;
 			*entry = a_hook;
 			VirtualProtect(entry, sizeof(void*), old, &old);
-			logger::info("hooked {} (vtable slot {} at {}, original {})", a_name, a_slot, Ptr(entry), Ptr(*a_original));
+			logger::info("hooked {} (vtable slot {}, original {})", a_name, a_slot, Ptr(*a_original));
 			return true;
 		}
 
-		void STDMETHODCALLTYPE HookSubmixDestroy(IXAudio2Voice* a_voice);
-
-		void HookDestroyOn(IXAudio2Voice* a_voice)
+		bool InstallThreadHook()
 		{
-			if (g_destroyHooked.exchange(true)) { return; }
-			void** vtable = *reinterpret_cast<void***>(a_voice);
-			if (!PatchSlot(vtable, slot::kDestroyVoice, reinterpret_cast<void*>(&HookSubmixDestroy),
-					reinterpret_cast<void**>(&g_origSubmixDestroy), "IXAudio2SubmixVoice::DestroyVoice"))
+			// Find the call to the per-pass sound processing inside the audio thread's run loop by its target, so the
+			// instruction offset may differ between runtimes (+0x57 on 1.5.97, +0x58 on 1.7.104).
+			const auto* loop = reinterpret_cast<const std::uint8_t*>(g_addr.threadLoop);
+			std::uintptr_t site = 0;
+			for (std::uintptr_t off = 0; off < 0x100 && !site; ++off)
 			{
-				g_destroyHooked = false;
+				if (loop[off] != 0xE8) { continue; }
+				std::int32_t rel = 0;
+				std::memcpy(&rel, loop + off + 1, sizeof(rel));
+				if (g_addr.threadLoop + off + 5 + static_cast<std::intptr_t>(rel) == g_addr.processSounds) { site = g_addr.threadLoop + off; }
 			}
-		}
-
-		// ---- the swap ----
-
-		bool Swap(Engine& a_engine, const Device& a_target, const std::vector<Device>& a_devices)
-		{
-			const std::string from = a_engine.deviceName.empty() ? std::string("(no device)") : a_engine.deviceName;
-			// Measured 2026-09-13: swapping the mastering voice while the engine processes crashed XAudio2's mixing thread
-			// (it still referenced the destroyed voice). The graph is only changed with the engine stopped.
-			a_engine.engine->StopEngine();
-			logger::debug("engine {} stopped for the switch", Ptr(a_engine.engine));
-			VoiceSends none{ 0, nullptr };
-			const HRESULT detach = a_engine.proxy->SetOutputVoices(&none);
-			if (FAILED(detach)) { logger::warn("detaching the stand-in voice failed ({}); continuing", Hr(detach)); }
-			if (a_engine.master)
+			if (!site)
 			{
-				a_engine.master->DestroyVoice();
-				a_engine.master = nullptr;
-			}
-
-			std::vector<const Device*> order{ &a_target };
-			if (const Device* def = DefaultDevice(a_devices); def && def != &a_target) { order.push_back(def); }
-			for (const auto& d : a_devices)
-			{
-				if (std::find(order.begin(), order.end(), &d) == order.end()) { order.push_back(&d); }
-			}
-
-			IXAudio2Voice* master = nullptr;
-			const Device* used = nullptr;
-			for (const Device* d : order)
-			{
-				HRESULT hr;
-				{
-					Inside inside;
-					hr = g_origMaster(a_engine.engine, &master, a_engine.reqChannels, a_engine.reqRate, a_engine.reqFlags, d->index, nullptr);
-				}
-				logger::debug("CreateMasteringVoice on [{}] \"{}\" (channels={} rate={}): {}", d->index, d->name, a_engine.reqChannels, a_engine.reqRate, Hr(hr));
-				if (SUCCEEDED(hr) && master)
-				{
-					used = d;
-					break;
-				}
-				master = nullptr;
-				if (hr == static_cast<HRESULT>(0x88960004))
-				{
-					a_engine.critical = true;
-					logger::warn("engine {} reports its device is invalid (0x88960004); no further outputs are attempted on it", Ptr(a_engine.engine));
-					break;
-				}
-			}
-
-			if (!used)
-			{
-				a_engine.deviceId.clear();
-				a_engine.deviceName.clear();
-				a_engine.lastResult = std::format("no device accepted a mastering voice (was \"{}\"); silent until a device appears", from);
-				if (!a_engine.critical) { a_engine.engine->StartEngine(); }
-				logger::warn("{}", a_engine.lastResult);
+				g_threadHookResult = "the call to the sound processing was not found in the audio thread loop; switching disabled";
+				logger::error("{}", g_threadHookResult);
 				return false;
 			}
-
-			SendDescriptor toMaster{ 0, master };
-			VoiceSends sends{ 1, &toMaster };
-			const HRESULT attach = a_engine.proxy->SetOutputVoices(&sends);
-			a_engine.master = master;
-			a_engine.deviceId = used->id;
-			a_engine.deviceName = used->name;
-			a_engine.lastSwapAt = std::chrono::steady_clock::now();
-			SetCurrentId(used->id);
-			const HRESULT start = a_engine.engine->StartEngine();
-			std::string restart = std::format("; engine restarted {}, new master {}", Hr(start), Ptr(master));
-			++a_engine.resets;
-			a_engine.lastResult = std::format("switched \"{}\" -> \"{}\" (attach {}{})", from, used->name, Hr(attach), restart);
-			if (used != &a_target) { a_engine.lastResult += std::format("; \"{}\" refused, used the next device", a_target.name); }
-			logger::info("engine {}: {}", Ptr(a_engine.engine), a_engine.lastResult);
-			return SUCCEEDED(attach);
+			SKSE::AllocTrampoline(14);
+			auto& trampoline = SKSE::GetTrampoline();
+			g_origProcessSounds = reinterpret_cast<ProcessSoundsFn>(trampoline.write_call<5>(site, reinterpret_cast<std::uintptr_t>(&HookProcessSounds)));
+			g_threadHookResult = std::format("hooked the audio thread's sound-processing call at +0x{:X}", site - g_addr.threadLoop);
+			logger::info("{}", g_threadHookResult);
+			return g_origProcessSounds != nullptr;
 		}
 
-		void DoResets(const std::string& a_reason, bool a_force, const std::string& a_avoidId, std::chrono::steady_clock::time_point a_urgentAt)
+		// ---- the decision, on the worker thread ----
+		std::mutex g_wakeLock;  // guards the fields below
+		std::condition_variable g_wakeCv;
+		bool g_pending{ false };
+		bool g_force{ false };
+		bool g_urgent{ false };
+		bool g_busy{ false };
+		std::string g_avoidId;
+		std::string g_pendingReason;
+		std::string g_lastReason{ "none" };
+		std::string g_watcherResult{ "not started" };
+		std::chrono::steady_clock::time_point g_lastEvent{};
+		std::uint32_t g_requests{ 0 };
+		std::uint32_t g_runs{ 0 };
+
+		void Evaluate(const std::string& a_reason, bool a_force, const std::string& a_avoidId)
 		{
-			std::scoped_lock lock(g_lock);
-			if (g_engines.empty())
+			State snap;
 			{
-				logger::debug("reset requested ({}) but the game has not created its audio engine yet", a_reason);
+				std::scoped_lock l(g_stateLock);
+				snap = g_state;
+			}
+			if (!g_threadHooked)
+			{
+				SetResult("switching is disabled: the audio thread could not be hooked", true);
 				return;
 			}
-			for (auto& owned : g_engines)
+			if (!GameAudioObject())
 			{
-				Engine& e = *owned;
-				if (!e.proxy) { continue; }
-				HRESULT listHr = S_OK;
-				auto devices = ListDevices(e.engine, listHr);
-				LogDevices(devices, listHr, "reset check");
-				if (!a_avoidId.empty())
+				logger::debug("switch check ({}) before the game created its audio", a_reason);
+				return;
+			}
+
+			auto active = ListEndpoints(true);
+			if (!a_avoidId.empty())
+			{
+				const std::string avoid = Lower(a_avoidId);
+				std::erase_if(active, [&](const Endpoint& e) { return e.id == avoid; });
+			}
+			const Endpoint* preferred = PreferredEndpoint(active);
+			const Endpoint* def = nullptr;
+			for (const auto& e : active) { if (e.isDefault) { def = &e; } }
+			const Endpoint* target = preferred ? preferred : (def ? def : (active.empty() ? nullptr : &active.front()));
+			const bool currentActive = std::any_of(active.begin(), active.end(), [&](const Endpoint& e) { return e.id == snap.deviceId; });
+			const bool critical = g_critical.load();
+
+			bool swap = false;
+			std::string decision;
+			if (!target) { decision = "no output device is connected; waiting for one"; }
+			else if (a_force) { swap = true; decision = "forced"; }
+			else if (critical) { swap = true; decision = "the engine lost its device"; }
+			else if (!snap.master) { swap = true; decision = "the game has no output yet"; }
+			else if (!currentActive) { swap = true; decision = "the current device is gone"; }
+			else if (preferred) { swap = snap.deviceId != preferred->id; decision = swap ? "the preferred device is available" : "already on the preferred device"; }
+			else if (settings::general::switchOnDefaultChange) { swap = snap.deviceId != target->id; decision = swap ? "the Windows default device changed" : "already on the Windows default device"; }
+			else { decision = "the current device is still connected and following the Windows default is off"; }
+
+			logger::info("switch check ({}): on \"{}\", target \"{}\", critical={}: {}", a_reason, snap.deviceName.empty() ? "(none)" : snap.deviceName,
+						 target ? target->name : "(none)", critical, decision);
+			if (!swap)
+			{
+				SetResult(decision);
+				return;
+			}
+
+			bool ready = false;
+			for (int attempt = 0; attempt < 10 && !ready; ++attempt)
+			{
+				ready = EndpointReady(target->id);
+				if (!ready)
 				{
-					const auto before = devices.size();
-					std::erase_if(devices, [&](const Device& d) { return Lower(d.id) == Lower(a_avoidId); });
-					const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - a_urgentAt).count();
-					logger::info("urgent switch: {} ms after the notification; the leaving device {} XAudio2's list; engine critical flag already set: {}",
-								 ms, before != devices.size() ? "was still in" : "was already gone from", e.critical.load());
-				}
-
-				const Device* current = nullptr;
-				if (!e.deviceId.empty())
-				{
-					for (const auto& d : devices) { if (d.id == e.deviceId) { current = &d; } }
-				}
-				const Device* preferred = PreferredMatch(devices);
-				const Device* def = DefaultDevice(devices);
-				const Device* target = preferred ? preferred : def;
-				const bool critical = e.critical.load();
-
-				// Measured 2026-09-13 on 1.5.97: after the active device is removed XAudio2 2.7 invalidates the whole engine;
-				// every CreateMasteringVoice on it fails with 0x88960004, and calling into it again was followed by a crash on
-				// XAudio2's own thread. So an engine that reported a critical error is left completely alone.
-				if (critical && e.master && std::chrono::steady_clock::now() - e.lastSwapAt < std::chrono::seconds(3))
-				{
-					// The error may belong to the device we just left. Without calling into the engine, see whether it is still mixing.
-					const auto p0 = e.passes.load();
-					std::this_thread::sleep_for(std::chrono::milliseconds(300));
-					const auto p1 = e.passes.load();
-					if (p1 > p0)
-					{
-						e.critical = false;
-						e.lastResult += "; a critical error arrived just after the switch but the engine kept processing - kept";
-						logger::info("engine {}: critical error right after a switch, engine still processing ({} passes in 300 ms) - kept", Ptr(e.engine), p1 - p0);
-						continue;
-					}
-				}
-				if (e.critical)
-				{
-					if (e.lastResult.rfind("engine invalidated", 0) != 0)
-					{
-						e.lastResult = "engine invalidated: its output device was removed and XAudio2 2.7 rejects any new output on this engine; the game's sound returns after a restart";
-						logger::warn("engine {}: {} (reason: {})", Ptr(e.engine), e.lastResult, a_reason);
-					}
-					continue;
-				}
-
-				bool swap = false;
-				std::string decision;
-				if (!target) { decision = "no output device exists; waiting for one"; }
-				else if (a_force) { swap = true; decision = "forced"; }
-				else if (!e.master) { swap = true; decision = "no device was attached"; }
-				else if (!current) { swap = true; decision = "the current device is gone"; }
-				else if (preferred) { swap = current != preferred; decision = swap ? "the preferred device is available" : "already on the preferred device"; }
-				else if (settings::general::switchOnDefaultChange) { swap = current != def; decision = swap ? "the Windows default device changed" : "already on the Windows default device"; }
-				else { decision = "the current device is still present and bSwitchOnDefaultChange is off"; }
-
-				logger::info("reset check ({}): engine {} on \"{}\", target \"{}\", critical={}: {}", a_reason, Ptr(e.engine),
-							 e.deviceName.empty() ? "(none)" : e.deviceName, target ? target->name : "(none)", critical, decision);
-				if (swap) { Swap(e, *target, devices); }
-				else { e.lastResult = decision; }
-			}
-		}
-
-		// ---- the hooks ----
-
-		// Diagnostics: prove whether an engine is created and initialised AFTER the hooks went in, even on a machine
-		// with no output device (where the game never reaches CreateMasteringVoice).
-		HRESULT STDMETHODCALLTYPE HookInitialize(IXAudio2* a_this, UINT32 a_flags, UINT32 a_processor)
-		{
-			const HRESULT hr = g_origInitialize(a_this, a_flags, a_processor);
-			if (t_inside == 0)
-			{
-				const auto n = g_initializeCalls.fetch_add(1) + 1;
-				logger::info("engine {} initialised (flags=0x{:X} processor=0x{:X}): {} - call {}", Ptr(a_this), a_flags, a_processor, Hr(hr), n);
-			}
-			return hr;
-		}
-
-		HRESULT STDMETHODCALLTYPE HookGetDeviceCount(IXAudio2* a_this, UINT32* a_count)
-		{
-			const HRESULT hr = g_origDeviceCount(a_this, a_count);
-			if (t_inside == 0 && g_deviceCountCalls.fetch_add(1) < 4)
-			{
-				logger::info("engine {} asked for its device count: {} device(s) ({})", Ptr(a_this), a_count ? *a_count : 0u, Hr(hr));
-			}
-			return hr;
-		}
-
-
-		HRESULT STDMETHODCALLTYPE HookCreateMastering(IXAudio2* a_this, IXAudio2Voice** a_out, UINT32 a_channels, UINT32 a_rate, UINT32 a_flags, UINT32 a_index, void* a_chain)
-		{
-			if (t_inside > 0 || !a_out || !settings::general::enabled)
-			{
-				return g_origMaster(a_this, a_out, a_channels, a_rate, a_flags, a_index, a_chain);
-			}
-
-			std::scoped_lock lock(g_lock);
-			logger::info("engine {} creates its mastering voice: channels={} rate={} flags=0x{:X} device index={} effect chain={}",
-						 Ptr(a_this), a_channels, a_rate, a_flags, a_index, Ptr(a_chain));
-			if (FindEngine(a_this))
-			{
-				logger::warn("engine {} already has a managed mastering voice; this one passes through unchanged", Ptr(a_this));
-				return g_origMaster(a_this, a_out, a_channels, a_rate, a_flags, a_index, a_chain);
-			}
-
-			HRESULT listHr = S_OK;
-			const auto devices = ListDevices(a_this, listHr);
-			LogDevices(devices, listHr, "engine start");
-
-			UINT32 pick = a_index;
-			std::string why = "the game's choice (the Windows default device)";
-			if (const Device* preferred = PreferredMatch(devices))
-			{
-				pick = preferred->index;
-				why = std::format("the preferred device \"{}\"", preferred->name);
-			}
-			else if (!settings::GetPreferredDevice().empty())
-			{
-				logger::info("preferred device \"{}\" is not present; using the game's choice", settings::GetPreferredDevice());
-			}
-
-			IXAudio2Voice* master = nullptr;
-			HRESULT hr;
-			{
-				Inside inside;
-				hr = g_origMaster(a_this, &master, a_channels, a_rate, a_flags, pick, nullptr);
-			}
-			if ((FAILED(hr) || !master) && pick != a_index)
-			{
-				logger::warn("the preferred device refused a mastering voice ({}); using the game's choice", Hr(hr));
-				pick = a_index;
-				why = "the game's choice (the preferred device refused)";
-				Inside inside;
-				hr = g_origMaster(a_this, &master, a_channels, a_rate, a_flags, pick, nullptr);
-			}
-			if (FAILED(hr) || !master)
-			{
-				logger::error("no mastering voice could be created ({}): no output device was usable when the game started, so the game has no audio this session", Hr(hr));
-				return FAILED(hr) ? hr : E_FAIL;
-			}
-
-			VoiceDetails details{};
-			master->GetVoiceDetails(&details);
-			SendDescriptor toMaster{ 0, master };
-			VoiceSends sends{ 1, &toMaster };
-			IXAudio2Voice* proxy = nullptr;
-			{
-				Inside inside;
-				hr = g_origSubmix(a_this, &proxy, details.InputChannels, details.InputSampleRate, 0, kProxyStage, &sends, a_chain);
-			}
-			if (FAILED(hr) || !proxy)
-			{
-				logger::error("could not create the stand-in submix voice ({}); this engine keeps a plain mastering voice and cannot switch devices", Hr(hr));
-				*a_out = master;
-				return S_OK;
-			}
-			HookDestroyOn(proxy);
-
-			auto engine = std::make_unique<Engine>();
-			engine->serial = g_nextSerial++;
-			engine->engine = a_this;
-			engine->master = master;
-			engine->proxy = proxy;
-			engine->reqChannels = a_channels;
-			engine->reqRate = a_rate;
-			engine->reqFlags = a_flags;
-			engine->gameIndex = a_index;
-			engine->proxyChannels = details.InputChannels;
-			engine->proxyRate = details.InputSampleRate;
-			for (const auto& d : devices)
-			{
-				if (d.index == pick)
-				{
-					engine->deviceId = d.id;
-					SetCurrentId(d.id);
-					engine->deviceName = d.name;
+					logger::info("\"{}\" is not taking audio yet (attempt {}); waiting", target->name, attempt + 1);
+					std::this_thread::sleep_for(std::chrono::seconds(1));
 				}
 			}
-			engine->callback = new EngineCallback(engine.get());
-			const HRESULT cb = a_this->RegisterForCallbacks(engine->callback);
-			engine->lastResult = std::format("started on \"{}\" ({})", engine->deviceName, why);
-			logger::info("engine {}: real mastering voice {} on [{}] \"{}\" ({}); stand-in submix {} ({} ch, {} Hz) handed to the game; critical-error callback {}",
-						 Ptr(a_this), Ptr(master), pick, engine->deviceName, why, Ptr(proxy), details.InputChannels, details.InputSampleRate, Hr(cb));
-			*a_out = proxy;
-			g_engines.push_back(std::move(engine));
-			return S_OK;
-		}
+			if (!ready)
+			{
+				SetResult(std::format("\"{}\" never started taking audio; no switch", target->name), true);
+				return;
+			}
 
-		HRESULT STDMETHODCALLTYPE HookCreateSubmix(IXAudio2* a_this, IXAudio2Voice** a_out, UINT32 a_channels, UINT32 a_rate, UINT32 a_flags, UINT32 a_stage, const VoiceSends* a_sends, void* a_chain)
-		{
-			if (t_inside > 0 || a_sends)
+			bool timedOut = false;
 			{
-				return g_origSubmix(a_this, a_out, a_channels, a_rate, a_flags, a_stage, a_sends, a_chain);
-			}
-			std::scoped_lock lock(g_lock);
-			const Engine* engine = FindEngine(a_this);
-			if (!engine || !engine->proxy || a_stage >= kProxyStage)
-			{
-				return g_origSubmix(a_this, a_out, a_channels, a_rate, a_flags, a_stage, a_sends, a_chain);
-			}
-			SendDescriptor toProxy{ 0, engine->proxy };
-			VoiceSends sends{ 1, &toProxy };
-			const HRESULT hr = g_origSubmix(a_this, a_out, a_channels, a_rate, a_flags, a_stage, &sends, a_chain);
-			if (g_redirectedSubmixes.fetch_add(1) == 0)
-			{
-				logger::debug("first submix voice with the default send list pointed at the stand-in ({})", Hr(hr));
-			}
-			return hr;
-		}
-
-		HRESULT STDMETHODCALLTYPE HookCreateSource(IXAudio2* a_this, IXAudio2Voice** a_out, const WAVEFORMATEX* a_format, UINT32 a_flags, float a_maxRatio, void* a_callback, const VoiceSends* a_sends, void* a_chain)
-		{
-			if (t_inside > 0 || a_sends)
-			{
-				return g_origSource(a_this, a_out, a_format, a_flags, a_maxRatio, a_callback, a_sends, a_chain);
-			}
-			std::scoped_lock lock(g_lock);
-			const Engine* engine = FindEngine(a_this);
-			if (!engine || !engine->proxy)
-			{
-				return g_origSource(a_this, a_out, a_format, a_flags, a_maxRatio, a_callback, a_sends, a_chain);
-			}
-			SendDescriptor toProxy{ 0, engine->proxy };
-			VoiceSends sends{ 1, &toProxy };
-			const HRESULT hr = g_origSource(a_this, a_out, a_format, a_flags, a_maxRatio, a_callback, &sends, a_chain);
-			if (g_redirectedSources.fetch_add(1) == 0)
-			{
-				logger::debug("first source voice with the default send list pointed at the stand-in ({})", Hr(hr));
-			}
-			return hr;
-		}
-
-		void STDMETHODCALLTYPE HookSubmixDestroy(IXAudio2Voice* a_voice)
-		{
-			std::scoped_lock lock(g_lock);
-			const auto it = std::find_if(g_engines.begin(), g_engines.end(), [&](const auto& e) { return e->proxy == a_voice; });
-			g_origSubmixDestroy(a_voice);
-			if (it == g_engines.end()) { return; }
-
-			Engine& e = **it;
-			logger::info("engine {}: the game destroyed its mastering voice (audio shutdown); destroying the real one on \"{}\"", Ptr(e.engine), e.deviceName);
-			if (e.master)
-			{
-				e.master->DestroyVoice();
-				e.master = nullptr;
-			}
-			e.engine->UnregisterForCallbacks(e.callback);
-			delete e.callback;
-			g_engines.erase(it);
-		}
-
-		ULONG STDMETHODCALLTYPE HookRelease(IXAudio2* a_this)
-		{
-			std::scoped_lock lock(g_lock);
-			const ULONG refs = g_origRelease(a_this);
-			if (refs == 0)
-			{
-				const auto it = std::find_if(g_engines.begin(), g_engines.end(), [&](const auto& e) { return e->engine == a_this; });
-				if (it != g_engines.end())
+				std::unique_lock l(g_swapLock);
+				g_swapTargetId = target->id;
+				g_swapDone = false;
+				g_swapPending = true;
+				if (!g_swapCv.wait_for(l, std::chrono::seconds(10), [] { return g_swapDone; }))
 				{
-					logger::info("engine {} released with its stand-in still recorded; record dropped", Ptr(a_this));
-					delete (*it)->callback;  // the engine is gone, so it can no longer call it
-					g_engines.erase(it);
+					g_swapPending = false;
+					g_swapTargetId.clear();
+					timedOut = true;
 				}
 			}
-			return refs;
+			if (timedOut)
+			{
+				SetResult("the game's audio thread did not run the switch within 10 s", true);
+				logger::warn("the game's audio thread did not run the switch within 10 s");
+			}
 		}
-
-		// ---- Windows endpoint notifications ----
 
 		class NotificationClient final : public IMMNotificationClient
 		{
 		public:
-			ULONG STDMETHODCALLTYPE AddRef() override { return 1; }   // static lifetime
+			ULONG STDMETHODCALLTYPE AddRef() override { return 1; }
 			ULONG STDMETHODCALLTYPE Release() override { return 1; }
 
 			HRESULT STDMETHODCALLTYPE QueryInterface(REFIID a_iid, void** a_out) override
@@ -688,24 +898,30 @@ namespace audioswitch
 
 			HRESULT STDMETHODCALLTYPE OnDeviceStateChanged(LPCWSTR a_id, DWORD a_state) override
 			{
-				const std::string id = Narrow(a_id);
-				const bool leaving = a_state != DEVICE_STATE_ACTIVE && IsCurrentDevice(id);
-				if (leaving) { logger::info("the game's current device {} is now {}: switching without delay", id, EndpointStateName(a_state)); }
+				const std::string id = Lower(Narrow(a_id));
+				bool leaving = false;
+				{
+					std::scoped_lock l(g_stateLock);
+					leaving = a_state != DEVICE_STATE_ACTIVE && !g_state.deviceId.empty() && g_state.deviceId == id;
+				}
 				RequestReset(std::format("endpoint {} is now {}", id, EndpointStateName(a_state)), false, leaving, leaving ? id : std::string());
 				return S_OK;
 			}
 
 			HRESULT STDMETHODCALLTYPE OnDeviceAdded(LPCWSTR a_id) override
 			{
-				RequestReset(std::format("endpoint {} added", Narrow(a_id)), false);
+				RequestReset(std::format("endpoint {} added", Lower(Narrow(a_id))), false);
 				return S_OK;
 			}
 
 			HRESULT STDMETHODCALLTYPE OnDeviceRemoved(LPCWSTR a_id) override
 			{
-				const std::string id = Narrow(a_id);
-				const bool leaving = IsCurrentDevice(id);
-				if (leaving) { logger::info("the game's current device {} was removed: switching without delay", id); }
+				const std::string id = Lower(Narrow(a_id));
+				bool leaving = false;
+				{
+					std::scoped_lock l(g_stateLock);
+					leaving = !g_state.deviceId.empty() && g_state.deviceId == id;
+				}
 				RequestReset(std::format("endpoint {} removed", id), false, leaving, leaving ? id : std::string());
 				return S_OK;
 			}
@@ -714,7 +930,7 @@ namespace audioswitch
 			{
 				if (a_flow == eRender && a_role == eConsole)
 				{
-					RequestReset(std::format("the Windows default output changed to {}", a_id ? Narrow(a_id) : std::string("(none)")), false);
+					RequestReset(std::format("the Windows default output changed to {}", a_id ? Lower(Narrow(a_id)) : std::string("(none)")), false);
 				}
 				return S_OK;
 			}
@@ -730,45 +946,42 @@ namespace audioswitch
 			IMMDeviceEnumerator* enumerator = nullptr;
 			HRESULT hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL, __uuidof(IMMDeviceEnumerator), reinterpret_cast<void**>(&enumerator));
 			if (SUCCEEDED(hr) && enumerator) { hr = enumerator->RegisterEndpointNotificationCallback(&g_client); }
+			std::string watcher = SUCCEEDED(hr) ? std::string("watching Windows audio endpoints") :
+			                                      std::format("endpoint notifications unavailable ({}); only device loss and the tool trigger switches", Hr(hr));
 			{
 				std::scoped_lock l(g_wakeLock);
-				g_watcherResult = SUCCEEDED(hr) ? std::string("watching Windows audio endpoints") :
-				                                  std::format("endpoint notifications unavailable ({}); only critical errors and the tool trigger resets", Hr(hr));
+				g_watcherResult = watcher;
 			}
-			if (SUCCEEDED(hr)) { logger::info("worker started (COM {}); watching Windows audio endpoints", Hr(co)); }
-			else { logger::error("worker started (COM {}) but endpoint notifications could not be registered ({})", Hr(co), Hr(hr)); }
-			// The enumerator stays alive for the life of the process: releasing it would end the notifications.
+			logger::info("worker started (COM {}): {}", Hr(co), watcher);
 
 			for (;;)
 			{
 				std::string reason;
-				bool force = false;
 				std::string avoid;
-				std::chrono::steady_clock::time_point urgentAt{};
+				bool force = false;
 				{
 					std::unique_lock l(g_wakeLock);
 					g_wakeCv.wait(l, [] { return g_pending; });
-					for (; !g_urgent;)
+					while (!g_urgent)
 					{
 						const auto due = g_lastEvent + std::chrono::milliseconds(settings::general::resetDelayMs.load());
 						if (std::chrono::steady_clock::now() >= due) { break; }
 						g_wakeCv.wait_until(l, due);
 					}
 					reason = std::move(g_pendingReason);
-					force = g_force;
 					avoid = std::move(g_avoidId);
-					urgentAt = g_urgentAt;
-					g_avoidId.clear();
-					g_urgent = false;
+					force = g_force;
 					g_pendingReason.clear();
+					g_avoidId.clear();
 					g_pending = false;
 					g_force = false;
+					g_urgent = false;
 					g_busy = true;
 					g_lastReason = reason;
 					++g_runs;
 				}
-				if (settings::general::enabled) { DoResets(reason, force, avoid, urgentAt); }
-				else { logger::debug("reset requested ({}) but bEnabled is off", reason); }
+				if (settings::general::enabled) { Evaluate(reason, force, avoid); }
+				else { logger::debug("switch check ({}) skipped: bEnabled is off", reason); }
 				{
 					std::scoped_lock l(g_wakeLock);
 					g_busy = false;
@@ -780,6 +993,16 @@ namespace audioswitch
 
 	void Install()
 	{
+		g_addr.threadLoop = REL::RelocationID(66482, 67746).address();
+		g_addr.processSounds = REL::RelocationID(66461, 67725).address();
+		g_addr.setupSound = REL::RelocationID(66762, 68003).address();
+		g_addr.voiceListA = REL::RelocationID(511864, 388390).address();
+		g_addr.voiceListB = REL::RelocationID(511867, 388393).address();
+		g_addr.audioObject = REL::RelocationID(523613, 410149).address();
+		g_addr.audioVtable = REL::RelocationID(285056, 236527).address();
+		logger::info("game addresses: thread loop {:X}, sound processing {:X}, sound setup {:X}, voice lists {:X}/{:X}, audio object {:X}, audio vtable {:X}",
+					 g_addr.threadLoop, g_addr.processSounds, g_addr.setupSound, g_addr.voiceListA, g_addr.voiceListB, g_addr.audioObject, g_addr.audioVtable);
+
 		HMODULE module = LoadLibraryW(L"XAudio2_7.dll");
 		if (!module)
 		{
@@ -788,10 +1011,8 @@ namespace audioswitch
 			return;
 		}
 		HMODULE pinned = nullptr;
-		GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_PIN, L"XAudio2_7.dll", &pinned);  // its vtable must never move
+		GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_PIN, L"XAudio2_7.dll", &pinned);  // the game frees it on every rebuild
 
-		// Read the shared vtable from a throwaway, uninitialised engine on a helper thread, so this plugin never
-		// chooses the COM apartment of the game's main thread.
 		void** vtable = nullptr;
 		HRESULT created = E_FAIL;
 		std::thread([&]() {
@@ -805,33 +1026,28 @@ namespace audioswitch
 			}
 			if (SUCCEEDED(co)) { CoUninitialize(); }
 		}).join();
-
 		if (FAILED(created) || !vtable)
 		{
 			g_installResult = std::format("the XAudio2 2.7 engine could not be created ({}); nothing hooked", Hr(created));
 			logger::error("{}", g_installResult);
 			return;
 		}
-
 		MEMORY_BASIC_INFORMATION info{};
 		if (!VirtualQuery(vtable, &info, sizeof(info)) || info.AllocationBase != static_cast<void*>(module))
 		{
-			g_installResult = std::format("the IXAudio2 vtable {} is not inside XAudio2_7.dll {}; nothing hooked (another layer wraps it)", Ptr(vtable), Ptr(module));
+			g_installResult = std::format("the IXAudio2 vtable {} is not inside XAudio2_7.dll; nothing hooked", Ptr(vtable));
 			logger::error("{}", g_installResult);
 			return;
 		}
 
 		bool ok = true;
 		ok &= PatchSlot(vtable, slot::kCreateMasteringVoice, reinterpret_cast<void*>(&HookCreateMastering), reinterpret_cast<void**>(&g_origMaster), "IXAudio2::CreateMasteringVoice");
-		ok &= PatchSlot(vtable, slot::kCreateSubmixVoice, reinterpret_cast<void*>(&HookCreateSubmix), reinterpret_cast<void**>(&g_origSubmix), "IXAudio2::CreateSubmixVoice");
-		ok &= PatchSlot(vtable, slot::kCreateSourceVoice, reinterpret_cast<void*>(&HookCreateSource), reinterpret_cast<void**>(&g_origSource), "IXAudio2::CreateSourceVoice");
-		ok &= PatchSlot(vtable, slot::kRelease, reinterpret_cast<void*>(&HookRelease), reinterpret_cast<void**>(&g_origRelease), "IXAudio2::Release");
 		ok &= PatchSlot(vtable, slot::kInitialize, reinterpret_cast<void*>(&HookInitialize), reinterpret_cast<void**>(&g_origInitialize), "IXAudio2::Initialize");
 		ok &= PatchSlot(vtable, slot::kGetDeviceCount, reinterpret_cast<void*>(&HookGetDeviceCount), reinterpret_cast<void**>(&g_origDeviceCount), "IXAudio2::GetDeviceCount");
-		g_hooked = ok && g_origMaster && g_origSubmix && g_origSource && g_origRelease && g_origInitialize && g_origDeviceCount;
-		g_installResult = g_hooked ? std::format("hooked (XAudio2_7.dll at {}, vtable {})", Ptr(module), Ptr(vtable)) :
-		                             std::string("one or more vtable slots could not be hooked");
-		logger::info("install: {}", g_installResult);
+		g_hooked = ok && g_origMaster && g_origInitialize && g_origDeviceCount;
+		g_threadHooked = g_hooked && InstallThreadHook();
+		g_installResult = g_hooked ? std::format("hooked (XAudio2_7.dll at {}, vtable {})", Ptr(module), Ptr(vtable)) : std::string("one or more vtable slots could not be hooked");
+		logger::info("install: {}; {}", g_installResult, g_threadHookResult);
 	}
 
 	void StartWatcher()
@@ -855,13 +1071,9 @@ namespace audioswitch
 			}
 			g_pending = true;
 			g_force = g_force || a_force;
+			g_urgent = g_urgent || a_urgent;
+			if (!a_avoidId.empty()) { g_avoidId = std::string(a_avoidId); }
 			g_lastEvent = std::chrono::steady_clock::now();
-			if (a_urgent)
-			{
-				g_urgent = true;
-				g_avoidId = std::string(a_avoidId);
-				g_urgentAt = g_lastEvent;
-			}
 			++g_requests;
 		}
 		g_wakeCv.notify_all();
@@ -873,126 +1085,17 @@ namespace audioswitch
 		return g_wakeCv.wait_for(l, std::chrono::milliseconds(a_timeoutMs), [] { return !g_pending && !g_busy; });
 	}
 
-	std::string StateJson()
-	{
-		std::string engines;
-		{
-			std::scoped_lock lock(g_lock);
-			for (const auto& e : g_engines)
-			{
-				if (!engines.empty()) { engines += ","; }
-				engines += std::format(
-					"{{\"engine\":\"{}\",\"device\":\"{}\",\"deviceId\":\"{}\",\"attached\":{},\"master\":\"{}\",\"standIn\":\"{}\","
-					"\"channels\":{},\"rate\":{},\"gameIndex\":{},\"passes\":{},\"critical\":{},\"criticalErrors\":{},\"lastCriticalHr\":\"{}\","
-					"\"resets\":{},\"lastResult\":\"{}\"}}",
-					Ptr(e->engine), EscapeJson(e->deviceName), EscapeJson(e->deviceId), e->master ? "true" : "false", Ptr(e->master), Ptr(e->proxy),
-					e->proxyChannels, e->proxyRate, e->gameIndex, e->passes.load(), e->critical.load() ? "true" : "false", e->criticalCount.load(),
-					Hr(e->lastCriticalHr.load()), e->resets, EscapeJson(e->lastResult));
-			}
-		}
-		std::scoped_lock l(g_wakeLock);
-		return std::format(
-			"\"hooks\":{{\"installed\":{},\"result\":\"{}\",\"destroyHooked\":{},\"redirectedSources\":{},\"redirectedSubmixes\":{},\"initializeCalls\":{},\"deviceCountCalls\":{}}},"
-			"\"worker\":{{\"result\":\"{}\",\"pending\":{},\"busy\":{},\"requests\":{},\"runs\":{},\"lastReason\":\"{}\"}},\"engines\":[{}]",
-			g_hooked.load() ? "true" : "false", EscapeJson(g_installResult), g_destroyHooked.load() ? "true" : "false", g_redirectedSources.load(),
-			g_redirectedSubmixes.load(), g_initializeCalls.load(), g_deviceCountCalls.load(), EscapeJson(g_watcherResult), g_pending ? "true" : "false", g_busy ? "true" : "false", g_requests, g_runs,
-			EscapeJson(g_lastReason), engines);
-	}
-
-	std::string DevicesJson()
-	{
-		std::string xa;
-		{
-			std::scoped_lock lock(g_lock);
-			if (!g_engines.empty())
-			{
-				HRESULT hr = S_OK;
-				for (const auto& d : ListDevices(g_engines.front()->engine, hr))
-				{
-					if (!xa.empty()) { xa += ","; }
-					xa += std::format("{{\"index\":{},\"name\":\"{}\",\"id\":\"{}\",\"role\":{},\"channels\":{},\"rate\":{}}}",
-						d.index, EscapeJson(d.name), EscapeJson(d.id), d.role, d.channels, d.rate);
-				}
-			}
-		}
-
-		std::string endpoints;
-		const HRESULT co = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-		IMMDeviceEnumerator* enumerator = nullptr;
-		if (SUCCEEDED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL, __uuidof(IMMDeviceEnumerator), reinterpret_cast<void**>(&enumerator))) && enumerator)
-		{
-			std::string defaultId;
-			IMMDevice* def = nullptr;
-			if (SUCCEEDED(enumerator->GetDefaultAudioEndpoint(eRender, eConsole, &def)) && def)
-			{
-				LPWSTR id = nullptr;
-				if (SUCCEEDED(def->GetId(&id)) && id)
-				{
-					defaultId = Narrow(id);
-					CoTaskMemFree(id);
-				}
-				def->Release();
-			}
-			IMMDeviceCollection* collection = nullptr;
-			if (SUCCEEDED(enumerator->EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE | DEVICE_STATE_UNPLUGGED | DEVICE_STATE_DISABLED, &collection)) && collection)
-			{
-				UINT count = 0;
-				collection->GetCount(&count);
-				for (UINT i = 0; i < count; ++i)
-				{
-					IMMDevice* device = nullptr;
-					if (FAILED(collection->Item(i, &device)) || !device) { continue; }
-					std::string id, name;
-					LPWSTR rawId = nullptr;
-					if (SUCCEEDED(device->GetId(&rawId)) && rawId)
-					{
-						id = Narrow(rawId);
-						CoTaskMemFree(rawId);
-					}
-					DWORD state = 0;
-					device->GetState(&state);
-					IPropertyStore* store = nullptr;
-					if (SUCCEEDED(device->OpenPropertyStore(STGM_READ, &store)) && store)
-					{
-						PROPVARIANT value;
-						PropVariantInit(&value);
-						if (SUCCEEDED(store->GetValue(PKEY_Device_FriendlyName, &value)) && value.vt == VT_LPWSTR) { name = Narrow(value.pwszVal); }
-						PropVariantClear(&value);
-						store->Release();
-					}
-					device->Release();
-					if (!endpoints.empty()) { endpoints += ","; }
-					endpoints += std::format("{{\"name\":\"{}\",\"id\":\"{}\",\"state\":\"{}\",\"default\":{}}}", EscapeJson(name), EscapeJson(id),
-						EndpointStateName(state), id == defaultId ? "true" : "false");
-				}
-				collection->Release();
-			}
-			enumerator->Release();
-		}
-		if (SUCCEEDED(co)) { CoUninitialize(); }
-		return std::format("\"xaudio2Devices\":[{}],\"windowsEndpoints\":[{}]", xa, endpoints);
-	}
-
 	Status GetStatus()
 	{
-		static std::mutex cacheLock;
-		static Status cached;
-		std::unique_lock lock(g_lock, std::try_to_lock);
-		std::scoped_lock c(cacheLock);
-		if (!lock.owns_lock()) { return cached; }
 		Status s;
-		s.hooked = g_hooked;
-		if (!g_engines.empty())
-		{
-			const Engine& e = *g_engines.front();
-			s.managed = true;
-			s.attached = e.master != nullptr;
-			s.critical = e.critical.load();
-			s.device = e.deviceName;
-			s.resets = e.resets;
-			s.lastResult = e.lastResult;
-		}
-		cached = s;
+		s.hooked = g_hooked && g_threadHooked;
+		std::scoped_lock l(g_stateLock);
+		s.managed = g_state.audio != nullptr;
+		s.attached = g_state.master != nullptr;
+		s.critical = g_critical.load();
+		s.device = g_state.deviceName;
+		s.resets = g_state.switches;
+		s.lastResult = g_state.lastResult;
 		return s;
 	}
 
@@ -1003,37 +1106,59 @@ namespace audioswitch
 		static std::chrono::steady_clock::time_point refreshed{};
 		std::scoped_lock c(cacheLock);
 		const auto now = std::chrono::steady_clock::now();
-		if (now - refreshed < std::chrono::seconds(1)) { return cached; }
-		std::unique_lock lock(g_lock, std::try_to_lock);
-		if (!lock.owns_lock()) { return cached; }
-		refreshed = now;
-		cached.clear();
-		if (!g_engines.empty())
+		if (now - refreshed >= std::chrono::seconds(2))
 		{
-			HRESULT hr = S_OK;
-			for (const auto& d : ListDevices(g_engines.front()->engine, hr)) { cached.push_back(d.name); }
+			refreshed = now;
+			cached.clear();
+			for (const auto& e : ListEndpoints(true)) { cached.push_back(e.name); }
 		}
 		return cached;
 	}
 
+	std::string StateJson()
+	{
+		State snap;
+		{
+			std::scoped_lock l(g_stateLock);
+			snap = g_state;
+		}
+		std::scoped_lock l(g_wakeLock);
+		return std::format(
+			"\"hooks\":{{\"installed\":{},\"result\":\"{}\",\"audioThread\":{},\"audioThreadResult\":\"{}\",\"initializeCalls\":{},\"deviceCountCalls\":{}}},"
+			"\"worker\":{{\"result\":\"{}\",\"pending\":{},\"busy\":{},\"swapPending\":{},\"requests\":{},\"runs\":{},\"lastReason\":\"{}\"}},"
+			"\"engines\":[{{\"audioObject\":\"{}\",\"engine\":\"{}\",\"master\":\"{}\",\"attached\":{},\"device\":\"{}\",\"deviceId\":\"{}\",\"channels\":{},\"rate\":{},"
+			"\"passes\":{},\"critical\":{},\"criticalErrors\":{},\"resets\":{},\"failures\":{},\"lastResult\":\"{}\"}}]",
+			g_hooked.load() ? "true" : "false", EscapeJson(g_installResult), g_threadHooked.load() ? "true" : "false", EscapeJson(g_threadHookResult),
+			g_initializeCalls.load(), g_deviceCountCalls.load(), EscapeJson(g_watcherResult), g_pending ? "true" : "false", g_busy ? "true" : "false",
+			g_swapPending.load() ? "true" : "false", g_requests, g_runs, EscapeJson(g_lastReason), Ptr(snap.audio), Ptr(snap.engine), Ptr(snap.master),
+			snap.master ? "true" : "false", EscapeJson(snap.deviceName), EscapeJson(snap.deviceId), snap.channels, snap.rate, g_passes.load(),
+			g_critical.load() ? "true" : "false", g_criticalCount.load(), snap.switches, snap.failures, EscapeJson(snap.lastResult));
+	}
+
+	std::string DevicesJson()
+	{
+		std::string endpoints;
+		for (const auto& e : ListEndpoints(false))
+		{
+			if (!endpoints.empty()) { endpoints += ","; }
+			endpoints += std::format("{{\"name\":\"{}\",\"id\":\"{}\",\"state\":\"{}\",\"default\":{}}}", EscapeJson(e.name), EscapeJson(e.id),
+				EndpointStateName(e.state), e.isDefault ? "true" : "false");
+		}
+		return std::format("\"windowsEndpoints\":[{}]", endpoints);
+	}
+
 	void LogSummary(std::string_view a_when)
 	{
-		std::scoped_lock lock(g_lock);
-		logger::info("{}: hooks {}; {} engine(s) managed", a_when, g_hooked ? "installed" : "NOT installed", g_engines.size());
-		if (g_hooked && g_engines.empty())
+		State snap;
 		{
-			if (g_initializeCalls > 0)
-			{
-				logger::warn("{}: the game started its audio engine but created no output - no output device was usable, so the game has no audio this session", a_when);
-			}
-			else
-			{
-				logger::warn("{}: the game has not started an audio engine through the hooks yet", a_when);
-			}
+			std::scoped_lock l(g_stateLock);
+			snap = g_state;
 		}
-		for (const auto& e : g_engines)
+		logger::info("{}: hooks {}, audio thread {}; game audio object {}; on \"{}\"; {} switch(es), last: {}", a_when, g_hooked ? "installed" : "NOT installed",
+					 g_threadHooked ? "hooked" : "NOT hooked", Ptr(snap.audio), snap.deviceName, snap.switches, snap.lastResult);
+		if (g_hooked && !snap.audio)
 		{
-			logger::info("  engine {} on \"{}\" ({} ch, {} Hz), {} reset(s), last: {}", Ptr(e->engine), e->deviceName, e->proxyChannels, e->proxyRate, e->resets, e->lastResult);
+			logger::warn("{}: the game has not created its audio output through the hooks - no output device was usable when it started", a_when);
 		}
 	}
 }
