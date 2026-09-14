@@ -325,6 +325,12 @@ namespace audioswitch
 					break;
 				}
 				master = nullptr;
+				if (hr == static_cast<HRESULT>(0x88960004))
+				{
+					a_engine.critical = true;
+					logger::warn("engine {} reports its device is invalid (0x88960004); no further outputs are attempted on it", Ptr(a_engine.engine));
+					break;
+				}
 			}
 
 			if (!used)
@@ -381,11 +387,23 @@ namespace audioswitch
 				const Device* target = preferred ? preferred : def;
 				const bool critical = e.critical.load();
 
+				// Measured 2026-09-13 on 1.5.97: after the active device is removed XAudio2 2.7 invalidates the whole engine;
+				// every CreateMasteringVoice on it fails with 0x88960004, and calling into it again was followed by a crash on
+				// XAudio2's own thread. So an engine that reported a critical error is left completely alone.
+				if (critical)
+				{
+					if (e.lastResult.rfind("engine invalidated", 0) != 0)
+					{
+						e.lastResult = "engine invalidated: its output device was removed and XAudio2 2.7 rejects any new output on this engine; the game's sound returns after a restart";
+						logger::warn("engine {}: {} (reason: {})", Ptr(e.engine), e.lastResult, a_reason);
+					}
+					continue;
+				}
+
 				bool swap = false;
 				std::string decision;
 				if (!target) { decision = "no output device exists; waiting for one"; }
 				else if (a_force) { swap = true; decision = "forced"; }
-				else if (critical) { swap = true; decision = "the engine reported a critical error"; }
 				else if (!e.master) { swap = true; decision = "no device was attached"; }
 				else if (!current) { swap = true; decision = "the current device is gone"; }
 				else if (preferred) { swap = current != preferred; decision = swap ? "the preferred device is available" : "already on the preferred device"; }

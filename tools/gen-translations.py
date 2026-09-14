@@ -64,6 +64,7 @@ def swap_log(text):
 NEW = {
     "japanese": {
         "AAIS_Status": "状態",
+        "AAIS_StatusInvalidated": "出力デバイスが取り外されたため音声が停止しました。このセッションでは復元できません。音声を戻すにはゲームを再起動してください。",
         "AAIS_StatusNotHooked": "ゲームのオーディオエンジンにフックできませんでした。理由はログを確認してください。",
         "AAIS_StatusNoEngine": "管理できるオーディオエンジンがありません。ゲーム起動時に使用可能な出力デバイスがありませんでした。",
         "AAIS_CurrentDevice": "再生中:",
@@ -86,6 +87,7 @@ NEW = {
     },
     "korean": {
         "AAIS_Status": "상태",
+        "AAIS_StatusInvalidated": "출력 장치가 제거되어 소리가 멈췄습니다. 이번 세션에서는 복구할 수 없으니 소리를 되찾으려면 게임을 다시 시작하세요.",
         "AAIS_StatusNotHooked": "게임의 오디오 엔진에 연결하지 못했습니다. 원인은 로그를 확인하세요.",
         "AAIS_StatusNoEngine": "관리할 오디오 엔진이 없습니다. 게임을 시작할 때 사용할 수 있는 출력 장치가 없었습니다.",
         "AAIS_CurrentDevice": "재생 장치:",
@@ -108,6 +110,7 @@ NEW = {
     },
     "chinese": {
         "AAIS_Status": "状态",
+        "AAIS_StatusInvalidated": "输出设备被移除，声音已停止。本次会话无法恢复，请重新启动游戏以恢复声音。",
         "AAIS_StatusNotHooked": "无法挂接游戏的音频引擎。原因请查看日志。",
         "AAIS_StatusNoEngine": "没有可管理的音频引擎——游戏启动时没有可用的输出设备。",
         "AAIS_CurrentDevice": "正在播放：",
@@ -130,6 +133,7 @@ NEW = {
     },
     "russian": {
         "AAIS_Status": "Состояние",
+        "AAIS_StatusInvalidated": "Звук остановился, потому что устройство вывода было отключено. В этом сеансе его не восстановить — перезапустите игру, чтобы вернуть звук.",
         "AAIS_StatusNotHooked": "Не удалось перехватить звуковой движок игры. Причина указана в журнале.",
         "AAIS_StatusNoEngine": "Нет звукового движка для управления: при запуске игры не было доступного устройства вывода.",
         "AAIS_CurrentDevice": "Воспроизведение на:",
@@ -152,6 +156,7 @@ NEW = {
     },
     "german": {
         "AAIS_Status": "Status",
+        "AAIS_StatusInvalidated": "Der Ton ist verstummt, weil das Ausgabegerät entfernt wurde. In dieser Sitzung lässt er sich nicht wiederherstellen – starte das Spiel neu, um wieder Ton zu haben.",
         "AAIS_StatusNotHooked": "Die Audio-Engine des Spiels konnte nicht eingebunden werden. Den Grund nennt das Log.",
         "AAIS_StatusNoEngine": "Das Spiel hat keine Audio-Engine, die verwaltet werden kann – beim Start war kein Ausgabegerät nutzbar.",
         "AAIS_CurrentDevice": "Wiedergabe auf:",
@@ -174,6 +179,7 @@ NEW = {
     },
     "french": {
         "AAIS_Status": "État",
+        "AAIS_StatusInvalidated": "Le son s'est arrêté car le périphérique de sortie a été retiré. Il ne peut pas être rétabli pendant cette session : relancez le jeu pour retrouver le son.",
         "AAIS_StatusNotHooked": "Impossible d'intercepter le moteur audio du jeu. Consultez le journal pour en connaître la raison.",
         "AAIS_StatusNoEngine": "Le jeu n'a aucun moteur audio à gérer : aucun périphérique de sortie n'était utilisable au lancement.",
         "AAIS_CurrentDevice": "Lecture sur :",
@@ -196,6 +202,7 @@ NEW = {
     },
     "spanish": {
         "AAIS_Status": "Estado",
+        "AAIS_StatusInvalidated": "El sonido se detuvo porque se retiró el dispositivo de salida. No se puede recuperar en esta sesión: reinicia el juego para recuperar el sonido.",
         "AAIS_StatusNotHooked": "No se pudo enganchar el motor de audio del juego. Consulta el registro para ver el motivo.",
         "AAIS_StatusNoEngine": "El juego no tiene un motor de audio que gestionar: no había ningún dispositivo de salida utilizable al iniciarse.",
         "AAIS_CurrentDevice": "Reproduciendo en:",
@@ -218,6 +225,7 @@ NEW = {
     },
     "italian": {
         "AAIS_Status": "Stato",
+        "AAIS_StatusInvalidated": "L'audio si è interrotto perché il dispositivo di uscita è stato rimosso. Non può essere ripristinato in questa sessione: riavvia il gioco per riavere l'audio.",
         "AAIS_StatusNotHooked": "Impossibile agganciare il motore audio del gioco. Il motivo è nel log.",
         "AAIS_StatusNoEngine": "Il gioco non ha un motore audio da gestire: all'avvio non c'era alcun dispositivo di uscita utilizzabile.",
         "AAIS_CurrentDevice": "In riproduzione su:",
@@ -240,6 +248,7 @@ NEW = {
     },
     "polish": {
         "AAIS_Status": "Stan",
+        "AAIS_StatusInvalidated": "Dźwięk zatrzymał się, bo urządzenie wyjściowe zostało odłączone. W tej sesji nie da się go przywrócić – uruchom grę ponownie, aby odzyskać dźwięk.",
         "AAIS_StatusNotHooked": "Nie udało się podpiąć silnika dźwięku gry. Przyczynę podaje dziennik.",
         "AAIS_StatusNoEngine": "Gra nie ma silnika dźwięku do zarządzania – przy uruchomieniu nie było dostępnego urządzenia wyjściowego.",
         "AAIS_CurrentDevice": "Odtwarzanie na:",
@@ -262,6 +271,7 @@ NEW = {
     },
     "czech": {
         "AAIS_Status": "Stav",
+        "AAIS_StatusInvalidated": "Zvuk se zastavil, protože výstupní zařízení bylo odebráno. V této relaci ho nelze obnovit – restartujte hru, aby se zvuk vrátil.",
         "AAIS_StatusNotHooked": "Zvukový engine hry se nepodařilo zachytit. Důvod je v logu.",
         "AAIS_StatusNoEngine": "Hra nemá žádný zvukový engine ke správě – při spuštění nebylo k dispozici žádné výstupní zařízení.",
         "AAIS_CurrentDevice": "Přehrává se na:",
