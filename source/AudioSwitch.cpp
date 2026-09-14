@@ -941,7 +941,14 @@ namespace audioswitch
 		logger::info("{}: hooks {}; {} engine(s) managed", a_when, g_hooked ? "installed" : "NOT installed", g_engines.size());
 		if (g_hooked && g_engines.empty())
 		{
-			logger::warn("{}: the game has not created an audio engine through the hooks - either audio initialises later, or it started before this plugin loaded", a_when);
+			if (g_initializeCalls > 0)
+			{
+				logger::warn("{}: the game started its audio engine but created no output - no output device was usable, so the game has no audio this session", a_when);
+			}
+			else
+			{
+				logger::warn("{}: the game has not started an audio engine through the hooks yet", a_when);
+			}
 		}
 		for (const auto& e : g_engines)
 		{
