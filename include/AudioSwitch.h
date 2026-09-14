@@ -16,11 +16,29 @@
 //  * Resets are requested by Windows endpoint notifications (device added, removed, state changed, default changed),
 //    by the engine's critical-error callback and by the DevBench tool, debounced, and run on a worker thread.
 
+#include <cstdint>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace audioswitch
 {
+	struct Status
+	{
+		bool hooked{ false };
+		bool managed{ false };    // the game's engine was created through the hooks
+		bool attached{ false };   // a real mastering voice exists
+		bool critical{ false };   // the device stopped working and no switch has succeeded since
+		std::string device;
+		std::uint32_t resets{ 0 };
+		std::string lastResult;
+	};
+
+	// For the settings page (render thread): never blocks on the worker - returns the last snapshot while a
+	// switch is running. The device list is refreshed at most once a second.
+	Status GetStatus();
+	std::vector<std::string> DeviceNames();
+
 	void Install();                                   // SKSEPluginLoad: pin XAudio2_7.dll and patch the vtable
 	void StartWatcher();                              // SKSEPluginLoad: endpoint notifications + the reset worker
 	void RequestReset(std::string_view a_reason, bool a_force);

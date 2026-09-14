@@ -188,6 +188,17 @@ namespace settings
 		return ok;
 	}
 
+	void RestoreDefaults()
+	{
+		// The compiled defaults, which the shipped INI repeats (rule 16).
+		debug::logLevel = 0;
+		general::enabled = true;
+		general::switchOnDefaultChange = true;
+		general::resetDelayMs = 500;
+		SetPreferredDevice("");
+		ApplyLogLevel();
+	}
+
 	void ApplyLogLevel()
 	{
 		const auto lvl = static_cast<spdlog::level::level_enum>(std::clamp<std::uint32_t>(debug::logLevel, 0u, 6u));

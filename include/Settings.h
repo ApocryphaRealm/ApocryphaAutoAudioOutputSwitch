@@ -27,6 +27,7 @@ namespace settings
 	void Init(const std::string& a_iniFileName);
 	bool Reload();
 	bool Save();
+	void RestoreDefaults();  // every setting back to its fresh-install value; nothing is written until Save
 	void ApplyLogLevel();
 	const std::string& GetIniPath();
 }

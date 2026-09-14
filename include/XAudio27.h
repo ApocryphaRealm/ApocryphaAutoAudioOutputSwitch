@@ -95,6 +95,8 @@ namespace xa27
 	namespace slot
 	{
 		inline constexpr std::size_t kRelease = 2;
+		inline constexpr std::size_t kGetDeviceCount = 3;
+		inline constexpr std::size_t kInitialize = 5;
 		inline constexpr std::size_t kCreateSourceVoice = 8;
 		inline constexpr std::size_t kCreateSubmixVoice = 9;
 		inline constexpr std::size_t kCreateMasteringVoice = 10;
@@ -102,6 +104,8 @@ namespace xa27
 	}
 
 	using ReleaseFn = ULONG(STDMETHODCALLTYPE*)(IXAudio2*);
+	using GetDeviceCountFn = HRESULT(STDMETHODCALLTYPE*)(IXAudio2*, UINT32*);
+	using InitializeFn = HRESULT(STDMETHODCALLTYPE*)(IXAudio2*, UINT32, UINT32);
 	using CreateSourceFn = HRESULT(STDMETHODCALLTYPE*)(IXAudio2*, IXAudio2Voice**, const WAVEFORMATEX*, UINT32, float, void*, const VoiceSends*, void*);
 	using CreateSubmixFn = HRESULT(STDMETHODCALLTYPE*)(IXAudio2*, IXAudio2Voice**, UINT32, UINT32, UINT32, UINT32, const VoiceSends*, void*);
 	using CreateMasteringFn = HRESULT(STDMETHODCALLTYPE*)(IXAudio2*, IXAudio2Voice**, UINT32, UINT32, UINT32, UINT32, void*);

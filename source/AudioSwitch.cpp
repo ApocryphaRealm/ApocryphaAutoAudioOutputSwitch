@@ -97,6 +97,14 @@ namespace audioswitch
 			}
 		}
 
+		thread_local int t_inside = 0;                    // > 0 while this plugin itself calls the original methods
+
+		struct Inside
+		{
+			Inside() { ++t_inside; }
+			~Inside() { --t_inside; }
+		};
+
 		struct Device
 		{
 			UINT32 index{ 0 };
@@ -111,7 +119,10 @@ namespace audioswitch
 		{
 			std::vector<Device> out;
 			UINT32 count = 0;
-			a_hr = a_engine->GetDeviceCount(&count);
+			{
+				Inside inside;
+				a_hr = a_engine->GetDeviceCount(&count);
+			}
 			if (FAILED(a_hr)) { return out; }
 			for (UINT32 i = 0; i < count; ++i)
 			{
@@ -209,19 +220,16 @@ namespace audioswitch
 		std::recursive_mutex g_lock;                      // guards g_engines and every call that changes a voice graph
 		std::vector<std::unique_ptr<Engine>> g_engines;
 		std::atomic<std::uint64_t> g_nextSerial{ 1 };
-		thread_local int t_inside = 0;                    // > 0 while this plugin itself calls the original methods
-
-		struct Inside
-		{
-			Inside() { ++t_inside; }
-			~Inside() { --t_inside; }
-		};
 
 		ReleaseFn g_origRelease{ nullptr };
 		CreateSourceFn g_origSource{ nullptr };
 		CreateSubmixFn g_origSubmix{ nullptr };
 		CreateMasteringFn g_origMaster{ nullptr };
 		DestroyVoiceFn g_origSubmixDestroy{ nullptr };
+		InitializeFn g_origInitialize{ nullptr };
+		GetDeviceCountFn g_origDeviceCount{ nullptr };
+		std::atomic<std::uint32_t> g_initializeCalls{ 0 };
+		std::atomic<std::uint32_t> g_deviceCountCalls{ 0 };
 		std::atomic<bool> g_hooked{ false };
 		std::atomic<bool> g_destroyHooked{ false };
 		std::atomic<std::uint32_t> g_redirectedSources{ 0 };
@@ -392,6 +400,30 @@ namespace audioswitch
 		}
 
 		// ---- the hooks ----
+
+		// Diagnostics: prove whether an engine is created and initialised AFTER the hooks went in, even on a machine
+		// with no output device (where the game never reaches CreateMasteringVoice).
+		HRESULT STDMETHODCALLTYPE HookInitialize(IXAudio2* a_this, UINT32 a_flags, UINT32 a_processor)
+		{
+			const HRESULT hr = g_origInitialize(a_this, a_flags, a_processor);
+			if (t_inside == 0)
+			{
+				const auto n = g_initializeCalls.fetch_add(1) + 1;
+				logger::info("engine {} initialised (flags=0x{:X} processor=0x{:X}): {} - call {}", Ptr(a_this), a_flags, a_processor, Hr(hr), n);
+			}
+			return hr;
+		}
+
+		HRESULT STDMETHODCALLTYPE HookGetDeviceCount(IXAudio2* a_this, UINT32* a_count)
+		{
+			const HRESULT hr = g_origDeviceCount(a_this, a_count);
+			if (t_inside == 0 && g_deviceCountCalls.fetch_add(1) < 4)
+			{
+				logger::info("engine {} asked for its device count: {} device(s) ({})", Ptr(a_this), a_count ? *a_count : 0u, Hr(hr));
+			}
+			return hr;
+		}
+
 
 		HRESULT STDMETHODCALLTYPE HookCreateMastering(IXAudio2* a_this, IXAudio2Voice** a_out, UINT32 a_channels, UINT32 a_rate, UINT32 a_flags, UINT32 a_index, void* a_chain)
 		{
@@ -719,7 +751,9 @@ namespace audioswitch
 		ok &= PatchSlot(vtable, slot::kCreateSubmixVoice, reinterpret_cast<void*>(&HookCreateSubmix), reinterpret_cast<void**>(&g_origSubmix), "IXAudio2::CreateSubmixVoice");
 		ok &= PatchSlot(vtable, slot::kCreateSourceVoice, reinterpret_cast<void*>(&HookCreateSource), reinterpret_cast<void**>(&g_origSource), "IXAudio2::CreateSourceVoice");
 		ok &= PatchSlot(vtable, slot::kRelease, reinterpret_cast<void*>(&HookRelease), reinterpret_cast<void**>(&g_origRelease), "IXAudio2::Release");
-		g_hooked = ok && g_origMaster && g_origSubmix && g_origSource && g_origRelease;
+		ok &= PatchSlot(vtable, slot::kInitialize, reinterpret_cast<void*>(&HookInitialize), reinterpret_cast<void**>(&g_origInitialize), "IXAudio2::Initialize");
+		ok &= PatchSlot(vtable, slot::kGetDeviceCount, reinterpret_cast<void*>(&HookGetDeviceCount), reinterpret_cast<void**>(&g_origDeviceCount), "IXAudio2::GetDeviceCount");
+		g_hooked = ok && g_origMaster && g_origSubmix && g_origSource && g_origRelease && g_origInitialize && g_origDeviceCount;
 		g_installResult = g_hooked ? std::format("hooked (XAudio2_7.dll at {}, vtable {})", Ptr(module), Ptr(vtable)) :
 		                             std::string("one or more vtable slots could not be hooked");
 		logger::info("install: {}", g_installResult);
@@ -777,10 +811,10 @@ namespace audioswitch
 		}
 		std::scoped_lock l(g_wakeLock);
 		return std::format(
-			"\"hooks\":{{\"installed\":{},\"result\":\"{}\",\"destroyHooked\":{},\"redirectedSources\":{},\"redirectedSubmixes\":{}}},"
+			"\"hooks\":{{\"installed\":{},\"result\":\"{}\",\"destroyHooked\":{},\"redirectedSources\":{},\"redirectedSubmixes\":{},\"initializeCalls\":{},\"deviceCountCalls\":{}}},"
 			"\"worker\":{{\"result\":\"{}\",\"pending\":{},\"busy\":{},\"requests\":{},\"runs\":{},\"lastReason\":\"{}\"}},\"engines\":[{}]",
 			g_hooked.load() ? "true" : "false", EscapeJson(g_installResult), g_destroyHooked.load() ? "true" : "false", g_redirectedSources.load(),
-			g_redirectedSubmixes.load(), EscapeJson(g_watcherResult), g_pending ? "true" : "false", g_busy ? "true" : "false", g_requests, g_runs,
+			g_redirectedSubmixes.load(), g_initializeCalls.load(), g_deviceCountCalls.load(), EscapeJson(g_watcherResult), g_pending ? "true" : "false", g_busy ? "true" : "false", g_requests, g_runs,
 			EscapeJson(g_lastReason), engines);
 	}
 
@@ -856,6 +890,49 @@ namespace audioswitch
 		}
 		if (SUCCEEDED(co)) { CoUninitialize(); }
 		return std::format("\"xaudio2Devices\":[{}],\"windowsEndpoints\":[{}]", xa, endpoints);
+	}
+
+	Status GetStatus()
+	{
+		static std::mutex cacheLock;
+		static Status cached;
+		std::unique_lock lock(g_lock, std::try_to_lock);
+		std::scoped_lock c(cacheLock);
+		if (!lock.owns_lock()) { return cached; }
+		Status s;
+		s.hooked = g_hooked;
+		if (!g_engines.empty())
+		{
+			const Engine& e = *g_engines.front();
+			s.managed = true;
+			s.attached = e.master != nullptr;
+			s.critical = e.critical.load();
+			s.device = e.deviceName;
+			s.resets = e.resets;
+			s.lastResult = e.lastResult;
+		}
+		cached = s;
+		return s;
+	}
+
+	std::vector<std::string> DeviceNames()
+	{
+		static std::mutex cacheLock;
+		static std::vector<std::string> cached;
+		static std::chrono::steady_clock::time_point refreshed{};
+		std::scoped_lock c(cacheLock);
+		const auto now = std::chrono::steady_clock::now();
+		if (now - refreshed < std::chrono::seconds(1)) { return cached; }
+		std::unique_lock lock(g_lock, std::try_to_lock);
+		if (!lock.owns_lock()) { return cached; }
+		refreshed = now;
+		cached.clear();
+		if (!g_engines.empty())
+		{
+			HRESULT hr = S_OK;
+			for (const auto& d : ListDevices(g_engines.front()->engine, hr)) { cached.push_back(d.name); }
+		}
+		return cached;
 	}
 
 	void LogSummary(std::string_view a_when)

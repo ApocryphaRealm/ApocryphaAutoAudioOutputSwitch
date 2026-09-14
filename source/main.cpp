@@ -7,8 +7,10 @@
 #include "AudioSwitch.h"
 #include "DevBenchTool.h"
 #include "Settings.h"
+#include "UI.h"
 
 #include "utils/Logger.h"
+#include "utils/Strings.h"
 
 namespace
 {
@@ -20,6 +22,8 @@ namespace
 			DevBenchTool::Init(false);
 			break;
 		case SKSE::MessagingInterface::kDataLoaded:
+			strings::Configure("ApocryphaAutoAudioInputSwitch");
+			UI::Register();
 			DevBenchTool::Init(true);
 			audioswitch::LogSummary("data loaded");
 			// A preferred device that appeared after the engine started, or a default that changed during loading.
