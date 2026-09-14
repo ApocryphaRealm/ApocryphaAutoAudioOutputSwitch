@@ -293,6 +293,10 @@ namespace audioswitch
 		bool Swap(Engine& a_engine, const Device& a_target, const std::vector<Device>& a_devices)
 		{
 			const std::string from = a_engine.deviceName.empty() ? std::string("(no device)") : a_engine.deviceName;
+			// Measured 2026-09-13: swapping the mastering voice while the engine processes crashed XAudio2's mixing thread
+			// (it still referenced the destroyed voice). The graph is only changed with the engine stopped.
+			a_engine.engine->StopEngine();
+			logger::debug("engine {} stopped for the switch", Ptr(a_engine.engine));
 			VoiceSends none{ 0, nullptr };
 			const HRESULT detach = a_engine.proxy->SetOutputVoices(&none);
 			if (FAILED(detach)) { logger::warn("detaching the stand-in voice failed ({}); continuing", Hr(detach)); }
@@ -338,6 +342,7 @@ namespace audioswitch
 				a_engine.deviceId.clear();
 				a_engine.deviceName.clear();
 				a_engine.lastResult = std::format("no device accepted a mastering voice (was \"{}\"); silent until a device appears", from);
+				if (!a_engine.critical) { a_engine.engine->StartEngine(); }
 				logger::warn("{}", a_engine.lastResult);
 				return false;
 			}
@@ -348,12 +353,8 @@ namespace audioswitch
 			a_engine.master = master;
 			a_engine.deviceId = used->id;
 			a_engine.deviceName = used->name;
-			std::string restart;
-			if (a_engine.critical.exchange(false))
-			{
-				const HRESULT start = a_engine.engine->StartEngine();
-				restart = std::format("; engine restarted after the critical error ({})", Hr(start));
-			}
+			const HRESULT start = a_engine.engine->StartEngine();
+			std::string restart = std::format("; engine restarted {}, new master {}", Hr(start), Ptr(master));
 			++a_engine.resets;
 			a_engine.lastResult = std::format("switched \"{}\" -> \"{}\" (attach {}{})", from, used->name, Hr(attach), restart);
 			if (used != &a_target) { a_engine.lastResult += std::format("; \"{}\" refused, used the next device", a_target.name); }
