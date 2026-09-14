@@ -17,6 +17,7 @@
 #include <objbase.h>
 #include <mmdeviceapi.h>
 #include <audioclient.h>
+#include <tlhelp32.h>
 #include <functiondiscoverykeys_devpkey.h>
 
 #include <algorithm>
@@ -243,6 +244,41 @@ namespace audioswitch
 			__except (EXCEPTION_EXECUTE_HANDLER) { return true; }
 		}
 
+		// After the game's own audio shutdown: the output-mixer table (list A: {effect object, submix voice} slots the game's
+		// sound outputs keep by index) still points at the voices and effect objects that shutdown destroyed, and the spare
+		// pool (list B) would hand them out again. Every A slot is emptied (the game null-checks a slot and fills empty ones
+		// when it makes a new mixer) and B is emptied. Returns the slots emptied, or -1 on a fault.
+		int ClearOutputMixers(std::uintptr_t a_table, std::uintptr_t a_pool, std::uint32_t* a_poolWas)
+		{
+			int cleared = 0;
+			*a_poolWas = 0;
+			__try
+			{
+				auto* head = reinterpret_cast<std::uint8_t*>(a_table);
+				const std::int32_t flags = *reinterpret_cast<std::int32_t*>(head);
+				const std::uint32_t count = *reinterpret_cast<std::uint32_t*>(head + kVoiceListCount);
+				auto* data = flags < 0 ? head + 8 : *reinterpret_cast<std::uint8_t**>(head + 8);
+				if (data && count <= 0x4000)
+				{
+					for (std::uint32_t i = 0; i < count; ++i)
+					{
+						std::uint8_t* entry = data + static_cast<std::size_t>(i) * 0x10;
+						if (*reinterpret_cast<void**>(entry) || *reinterpret_cast<void**>(entry + 8))
+						{
+							*reinterpret_cast<void**>(entry) = nullptr;
+							*reinterpret_cast<void**>(entry + 8) = nullptr;
+							++cleared;
+						}
+					}
+				}
+				auto* pool = reinterpret_cast<std::uint8_t*>(a_pool);
+				*a_poolWas = *reinterpret_cast<std::uint32_t*>(pool + kVoiceListCount);
+				*reinterpret_cast<std::uint32_t*>(pool + kVoiceListCount) = 0;
+			}
+			__except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+			return cleared;
+		}
+
 		// Nulls entries of a global voice list whose voice was already freed, so the game's shutdown skips them.
 		int ScrubVoiceList(std::uintptr_t a_head)
 		{
@@ -291,6 +327,20 @@ namespace audioswitch
 		std::atomic<bool> g_critical{ false };
 		std::atomic<std::uint32_t> g_criticalCount{ 0 };
 		std::atomic<std::uint64_t> g_passes{ 0 };
+
+		// ---- audio thread watch: where the game's audio thread is when a switch is not taken (the first real
+		// headset unplug, 2026-09-14, left the switch untaken for 10 s with no critical error) ----
+		std::atomic<std::uint32_t> g_audioTid{ 0 };
+		std::atomic<std::int64_t> g_lastEnterMs{ 0 };   // the audio thread entered the sound processing
+		std::atomic<std::int64_t> g_lastExitMs{ 0 };    // ... and left it
+		std::atomic<std::uint64_t> g_iterations{ 0 };
+		std::atomic<std::int64_t> g_lastPassMs{ 0 };    // the engine's last OnProcessingPassEnd
+		std::atomic<int> g_swapStep{ 0 };               // 0 idle, 1 detach, 2 scrub, 3 shutdown, 4 init, 5 revive
+
+		std::int64_t NowMs()
+		{
+			return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+		}
 		thread_local int t_inside = 0;
 
 		struct Inside
@@ -300,6 +350,23 @@ namespace audioswitch
 		};
 
 		CreateMasteringFn g_origMaster{ nullptr };
+		CreateSourceFn g_origCreateSource{ nullptr };
+		CreateSubmixFn g_origCreateSubmix{ nullptr };
+
+		// Send lists with an empty output. XAudio2 2.7's CreateSendList reads pOutputVoice+0xE8 with no null check
+		// (crash XAudio2_7+0x28B53, seen in game 2026-09-14 nine seconds after a real headset unplug; Live Audio Output
+		// Switching SE documents the same address). The game emits one when an effect mixer it routes a sound through
+		// is gone after a rebuild; the send is dropped and the sound keeps its other outputs.
+		std::atomic<std::uint32_t> g_droppedSends{ 0 };
+		std::atomic<bool> g_dropLogged{ false };
+		using SetOutputVoicesFn = HRESULT(STDMETHODCALLTYPE*)(IXAudio2Voice*, const VoiceSends*);
+		struct VoiceVtableHook
+		{
+			void** vtable{ nullptr };
+			SetOutputVoicesFn original{ nullptr };
+		};
+		VoiceVtableHook g_voiceVtables[6]{};
+		std::mutex g_voiceVtableLock;
 		InitializeFn g_origInitialize{ nullptr };
 		GetDeviceCountFn g_origDeviceCount{ nullptr };
 		using ProcessSoundsFn = void (*)(void*);
@@ -498,9 +565,14 @@ namespace audioswitch
 		{
 		public:
 			void STDMETHODCALLTYPE OnProcessingPassStart() override {}
-			void STDMETHODCALLTYPE OnProcessingPassEnd() override { g_passes.fetch_add(1, std::memory_order_relaxed); }
-			void STDMETHODCALLTYPE OnCriticalError(HRESULT) override
+			void STDMETHODCALLTYPE OnProcessingPassEnd() override
 			{
+				g_passes.fetch_add(1, std::memory_order_relaxed);
+				g_lastPassMs.store(NowMs(), std::memory_order_relaxed);
+			}
+			void STDMETHODCALLTYPE OnCriticalError(HRESULT a_error) override
+			{
+				logger::warn("the audio engine reported a critical error {} (engine passes {})", Hr(a_error), g_passes.load());
 				g_criticalCount.fetch_add(1);
 				g_critical = true;
 				RequestReset("the audio engine lost its device", false, true);
@@ -520,7 +592,114 @@ namespace audioswitch
 			return IsGameAudioObject(object) ? object : nullptr;
 		}
 
+		// ---- send filtering ----
+		constexpr UINT32 kMaxSends = 64;
+
+		// Returns the list to hand to XAudio2: the caller's own, or a_tmp holding it without its empty outputs.
+		const VoiceSends* FilterSends(const VoiceSends* a_sends, VoiceSends* a_tmp, SendDescriptor* a_buf, UINT32* a_dropped)
+		{
+			*a_dropped = 0;
+			if (!a_sends) { return a_sends; }
+			__try
+			{
+				const UINT32 count = a_sends->SendCount;
+				if (count == 0 || count > kMaxSends || !a_sends->pSends) { return a_sends; }
+				UINT32 kept = 0;
+				for (UINT32 i = 0; i < count; ++i)
+				{
+					if (a_sends->pSends[i].pOutputVoice) { a_buf[kept++] = a_sends->pSends[i]; }
+				}
+				if (kept == count) { return a_sends; }
+				*a_dropped = count - kept;
+				a_tmp->SendCount = kept;
+				a_tmp->pSends = kept ? a_buf : nullptr;
+				return a_tmp;
+			}
+			__except (EXCEPTION_EXECUTE_HANDLER) { return a_sends; }
+		}
+
+		void NoteDropped(UINT32 a_dropped, const char* a_where)
+		{
+			if (!a_dropped) { return; }
+			const auto total = g_droppedSends.fetch_add(a_dropped) + a_dropped;
+			if (!g_dropLogged.exchange(true))
+			{
+				logger::warn("{}: dropped {} send(s) with no output voice (an effect mixer the game routes through is gone after the rebuild); {} dropped so far", a_where, a_dropped, total);
+			}
+		}
+
+		SetOutputVoicesFn OriginalSetOutputVoices(IXAudio2Voice* a_voice)
+		{
+			void** vtable = *reinterpret_cast<void***>(a_voice);
+			for (const auto& h : g_voiceVtables) { if (h.vtable == vtable) { return h.original; } }
+			return nullptr;
+		}
+
+		HRESULT STDMETHODCALLTYPE HookSetOutputVoices(IXAudio2Voice* a_this, const VoiceSends* a_sends)
+		{
+			const SetOutputVoicesFn original = OriginalSetOutputVoices(a_this);
+			if (!original) { return E_FAIL; }  // unreachable: an entry is filled before its slot is patched
+			VoiceSends tmp{};
+			SendDescriptor buf[kMaxSends];
+			UINT32 dropped = 0;
+			const VoiceSends* pass = FilterSends(a_sends, &tmp, buf, &dropped);
+			NoteDropped(dropped, "IXAudio2Voice::SetOutputVoices");
+			return original(a_this, pass);
+		}
+
+		// Each voice class (source, submix, mastering, ...) has its own vtable in XAudio2_7.dll; its SetOutputVoices slot is
+		// patched the first time a voice of that class is created.
+		void HookVoiceVtable(IXAudio2Voice* a_voice)
+		{
+			if (!a_voice) { return; }
+			void** vtable = *reinterpret_cast<void***>(a_voice);
+			std::scoped_lock l(g_voiceVtableLock);
+			for (const auto& h : g_voiceVtables) { if (h.vtable == vtable) { return; } }
+			for (auto& h : g_voiceVtables)
+			{
+				if (h.vtable) { continue; }
+				void** entry = vtable + 1;
+				DWORD old = 0;
+				if (!VirtualProtect(entry, sizeof(void*), PAGE_READWRITE, &old))
+				{
+					logger::warn("could not unprotect IXAudio2Voice::SetOutputVoices on vtable {} (error {})", Ptr(vtable), GetLastError());
+					return;
+				}
+				h.original = reinterpret_cast<SetOutputVoicesFn>(*entry);
+				h.vtable = vtable;
+				*entry = reinterpret_cast<void*>(&HookSetOutputVoices);
+				VirtualProtect(entry, sizeof(void*), old, &old);
+				logger::info("hooked IXAudio2Voice::SetOutputVoices (voice vtable {}, original {})", Ptr(vtable), Ptr(h.original));
+				return;
+			}
+			logger::warn("a seventh voice vtable {} was seen; its sends are not filtered", Ptr(vtable));
+		}
+
 		// ---- hooks ----
+		HRESULT STDMETHODCALLTYPE HookCreateSource(IXAudio2* a_this, IXAudio2Voice** a_out, const WAVEFORMATEX* a_format, UINT32 a_flags, float a_maxRatio, void* a_callback, const VoiceSends* a_sends, void* a_chain)
+		{
+			VoiceSends tmp{};
+			SendDescriptor buf[kMaxSends];
+			UINT32 dropped = 0;
+			const VoiceSends* pass = FilterSends(a_sends, &tmp, buf, &dropped);
+			NoteDropped(dropped, "IXAudio2::CreateSourceVoice");
+			const HRESULT hr = g_origCreateSource(a_this, a_out, a_format, a_flags, a_maxRatio, a_callback, pass, a_chain);
+			if (SUCCEEDED(hr) && a_out) { HookVoiceVtable(*a_out); }
+			return hr;
+		}
+
+		HRESULT STDMETHODCALLTYPE HookCreateSubmix(IXAudio2* a_this, IXAudio2Voice** a_out, UINT32 a_channels, UINT32 a_rate, UINT32 a_flags, UINT32 a_stage, const VoiceSends* a_sends, void* a_chain)
+		{
+			VoiceSends tmp{};
+			SendDescriptor buf[kMaxSends];
+			UINT32 dropped = 0;
+			const VoiceSends* pass = FilterSends(a_sends, &tmp, buf, &dropped);
+			NoteDropped(dropped, "IXAudio2::CreateSubmixVoice");
+			const HRESULT hr = g_origCreateSubmix(a_this, a_out, a_channels, a_rate, a_flags, a_stage, pass, a_chain);
+			if (SUCCEEDED(hr) && a_out) { HookVoiceVtable(*a_out); }
+			return hr;
+		}
+
 		HRESULT STDMETHODCALLTYPE HookInitialize(IXAudio2* a_this, UINT32 a_flags, UINT32 a_processor)
 		{
 			const HRESULT hr = g_origInitialize(a_this, a_flags, a_processor);
@@ -648,6 +827,7 @@ namespace audioswitch
 		void PerformSwap()
 		{
 			const auto start = std::chrono::steady_clock::now();
+			g_swapStep = 1;
 			void* audio = GameAudioObject();
 			auto* mgr = RE::BSAudioManager::GetSingleton();
 			if (!audio || !mgr)
@@ -676,10 +856,12 @@ namespace audioswitch
 			}
 
 			// 2. already-freed voices left in the game's own voice lists would crash its shutdown
+			g_swapStep = 2;
 			const int scrubbed = ScrubVoiceList(g_addr.voiceListA) + ScrubVoiceList(g_addr.voiceListB);
 
 			// 3. the game's own shutdown and init; init creates the mastering voice through our hook on the target
 			SehInfo seh{};
+			g_swapStep = 3;
 			CallGameSlot(audio, kSlotShutdown, &seh);
 			{
 				std::scoped_lock l(g_stateLock);
@@ -692,6 +874,10 @@ namespace audioswitch
 				FailSwap(std::format("switch failed: the game's audio shutdown faulted (0x{:08X}); sounds were dropped", seh.code));
 				return;
 			}
+			std::uint32_t poolWas = 0;
+			const int mixersCleared = ClearOutputMixers(g_addr.voiceListA, g_addr.voiceListB, &poolWas);
+			g_dropLogged = false;
+			g_swapStep = 4;
 			const int initResult = CallGameSlot(audio, kSlotInit, &seh);
 			if (seh.code)
 			{
@@ -706,6 +892,7 @@ namespace audioswitch
 				return;
 			}
 
+			g_swapStep = 5;
 			// 4. the game's own per-sound voice setup rebuilds every surviving sound on the new engine
 			int revived = 0;
 			int failed = 0;
@@ -720,8 +907,8 @@ namespace audioswitch
 			{
 				std::scoped_lock l(g_stateLock);
 				++g_state.switches;
-				g_state.lastResult = std::format("switched \"{}\" -> \"{}\" in {} ms: {} sound(s) revived, {} failed, {} removed; {} voice(s) detached, {} stale list entr{} cleared, init {}",
-					from, g_state.deviceName, ms, revived, failed, removed, detached, scrubbed, scrubbed == 1 ? "y" : "ies", initResult);
+				g_state.lastResult = std::format("switched \"{}\" -> \"{}\" in {} ms: {} sound(s) revived, {} failed, {} removed; {} voice(s) detached, {} stale list entr{} cleared, {} output mixer slot(s) and {} spare(s) emptied, init {}",
+					from, g_state.deviceName, ms, revived, failed, removed, detached, scrubbed, scrubbed == 1 ? "y" : "ies", mixersCleared, poolWas, initResult);
 				logger::info("{}", g_state.lastResult);
 			}
 			FinishSwap();
@@ -729,8 +916,16 @@ namespace audioswitch
 
 		void HookProcessSounds(void* a_manager)
 		{
-			if (g_swapPending.exchange(false)) { PerformSwap(); }
+			g_audioTid.store(GetCurrentThreadId(), std::memory_order_relaxed);
+			g_lastEnterMs.store(NowMs(), std::memory_order_relaxed);
+			g_iterations.fetch_add(1, std::memory_order_relaxed);
+			if (g_swapPending.exchange(false))
+			{
+				PerformSwap();
+				g_swapStep = 0;
+			}
 			g_origProcessSounds(a_manager);
+			g_lastExitMs.store(NowMs(), std::memory_order_relaxed);
 		}
 
 		bool PatchSlot(void** a_vtable, std::size_t a_slot, void* a_hook, void** a_original, const char* a_name)
@@ -775,6 +970,148 @@ namespace audioswitch
 			g_threadHookResult = std::format("hooked the audio thread's sound-processing call at +0x{:X}", site - g_addr.threadLoop);
 			logger::info("{}", g_threadHookResult);
 			return g_origProcessSounds != nullptr;
+		}
+
+		// ---- diagnostics: stacks of the audio thread and of every thread inside the audio engine ----
+		std::uint64_t ReadValueSafe(void* a_base, std::uintptr_t a_off, int a_size)
+		{
+			if (!a_base) { return ~0ull; }
+			__try
+			{
+				const auto* p = static_cast<std::uint8_t*>(a_base) + a_off;
+				if (a_size == 1) { return *p; }
+				if (a_size == 4) { std::uint32_t v = 0; std::memcpy(&v, p, 4); return v; }
+				std::uint64_t v = 0;
+				std::memcpy(&v, p, 8);
+				return v;
+			}
+			__except (EXCEPTION_EXECUTE_HANDLER) { return ~0ull; }
+		}
+
+		struct StackFrames
+		{
+			DWORD64 pc[24];
+			int count;
+		};
+
+		// The thread is suspended by the caller. No allocation and no logging here: the suspended thread may hold the
+		// heap or the logger's lock.
+		int WalkSuspended(HANDLE a_thread, StackFrames* a_out)
+		{
+			a_out->count = 0;
+			CONTEXT ctx;
+			std::memset(&ctx, 0, sizeof(ctx));
+			ctx.ContextFlags = CONTEXT_FULL;
+			if (!GetThreadContext(a_thread, &ctx)) { return -1; }
+			__try
+			{
+				for (int i = 0; i < 24 && ctx.Rip; ++i)
+				{
+					a_out->pc[a_out->count++] = ctx.Rip;
+					DWORD64 imageBase = 0;
+					PRUNTIME_FUNCTION fn = RtlLookupFunctionEntry(ctx.Rip, &imageBase, nullptr);
+					if (!fn)
+					{
+						ctx.Rip = *reinterpret_cast<DWORD64*>(ctx.Rsp);
+						ctx.Rsp += 8;
+						continue;
+					}
+					PVOID handlerData = nullptr;
+					DWORD64 establisher = 0;
+					RtlVirtualUnwind(UNW_FLAG_NHANDLER, imageBase, ctx.Rip, fn, &ctx, &handlerData, &establisher, nullptr);
+				}
+			}
+			__except (EXCEPTION_EXECUTE_HANDLER) {}
+			return a_out->count;
+		}
+
+		bool CaptureStack(DWORD a_tid, StackFrames& a_out)
+		{
+			a_out.count = 0;
+			if (a_tid == 0 || a_tid == GetCurrentThreadId()) { return false; }
+			HANDLE h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, a_tid);
+			if (!h) { return false; }
+			bool ok = false;
+			if (SuspendThread(h) != static_cast<DWORD>(-1))
+			{
+				ok = WalkSuspended(h, &a_out) > 0;
+				ResumeThread(h);
+			}
+			CloseHandle(h);
+			return ok;
+		}
+
+		std::string FrameText(DWORD64 a_pc)
+		{
+			HMODULE mod = nullptr;
+			if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, reinterpret_cast<LPCWSTR>(a_pc), &mod) && mod)
+			{
+				wchar_t path[MAX_PATH]{};
+				GetModuleFileNameW(mod, path, MAX_PATH);
+				const wchar_t* base = path;
+				for (const wchar_t* c = path; *c; ++c) { if (*c == L'\\' || *c == L'/') { base = c + 1; } }
+				return std::format("{}+{:X}", Narrow(base), a_pc - reinterpret_cast<DWORD64>(mod));
+			}
+			return std::format("{:X}", a_pc);
+		}
+
+		std::string StackText(const StackFrames& a_frames, bool* a_inAudio = nullptr)
+		{
+			std::string out;
+			bool audio = false;
+			for (int i = 0; i < a_frames.count; ++i)
+			{
+				const std::string frame = FrameText(a_frames.pc[i]);
+				const std::string low = Lower(frame);
+				audio = audio || low.find("xaudio2") != std::string::npos || low.find("audioses") != std::string::npos || low.find("xapofx") != std::string::npos;
+				if (!out.empty()) { out += " <- "; }
+				out += frame;
+			}
+			if (a_inAudio) { *a_inAudio = audio; }
+			return out;
+		}
+
+		void ReportAudioThread(std::string_view a_why)
+		{
+			const auto now = NowMs();
+			auto age = [now](std::int64_t a_t) { return a_t ? now - a_t : -1; };
+			void* mgr = RE::BSAudioManager::GetSingleton();
+			void* thread = reinterpret_cast<void*>(ReadValueSafe(mgr, 0xF8, 8));
+			const DWORD tid = g_audioTid.load();
+			const auto enter = g_lastEnterMs.load();
+			const auto exit = g_lastExitMs.load();
+			logger::warn("audio thread watch ({}): thread {} (manager says {}), {} pass(es); entered the sound processing {} ms ago, left it {} ms ago - {}; switch step {}; engine passes {} (last {} ms ago); critical errors {}; thread object {} busy@48={} sync@60={} stop@61={}",
+				a_why, tid, ReadValueSafe(mgr, 0xF4, 4), g_iterations.load(), age(enter), age(exit), enter > exit ? "INSIDE the sound processing" : "between passes",
+				g_swapStep.load(), g_passes.load(), age(g_lastPassMs.load()), g_criticalCount.load(), Ptr(thread),
+				ReadValueSafe(thread, 0x48, 1), ReadValueSafe(thread, 0x60, 1), ReadValueSafe(thread, 0x61, 1));
+
+			StackFrames frames{};
+			if (CaptureStack(tid, frames)) { logger::warn("audio thread {} stack: {}", tid, StackText(frames)); }
+			else { logger::warn("audio thread {} stack: could not be captured", tid); }
+
+			HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+			if (snap == INVALID_HANDLE_VALUE) { return; }
+			THREADENTRY32 te{};
+			te.dwSize = sizeof(te);
+			const DWORD pid = GetCurrentProcessId();
+			int scanned = 0;
+			int inAudio = 0;
+			for (BOOL more = Thread32First(snap, &te); more; more = Thread32Next(snap, &te))
+			{
+				if (te.th32OwnerProcessID != pid || te.th32ThreadID == tid || te.th32ThreadID == GetCurrentThreadId()) { continue; }
+				++scanned;
+				StackFrames f{};
+				if (!CaptureStack(te.th32ThreadID, f)) { continue; }
+				bool audio = false;
+				const std::string text = StackText(f, &audio);
+				if (audio)
+				{
+					++inAudio;
+					logger::warn("thread {} (in the audio engine or audio session) stack: {}", te.th32ThreadID, text);
+				}
+			}
+			CloseHandle(snap);
+			logger::warn("audio thread watch: {} other thread(s) scanned, {} inside the audio engine or audio session", scanned, inAudio);
 		}
 
 		// ---- the decision, on the worker thread ----
@@ -864,15 +1201,31 @@ namespace audioswitch
 				g_swapTargetId = target->id;
 				g_swapDone = false;
 				g_swapPending = true;
-				if (!g_swapCv.wait_for(l, std::chrono::seconds(10), [] { return g_swapDone; }))
+				bool reported = false;
+				const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+				while (!g_swapDone)
 				{
-					g_swapPending = false;
-					g_swapTargetId.clear();
-					timedOut = true;
+					const auto step = std::min(deadline, std::chrono::steady_clock::now() + std::chrono::seconds(2));
+					if (g_swapCv.wait_until(l, step, [] { return g_swapDone; })) { break; }
+					if (std::chrono::steady_clock::now() >= deadline)
+					{
+						g_swapPending = false;
+						g_swapTargetId.clear();
+						timedOut = true;
+						break;
+					}
+					if (!reported)
+					{
+						reported = true;
+						l.unlock();
+						ReportAudioThread("a switch has waited 2 s for the audio thread");
+						l.lock();
+					}
 				}
 			}
 			if (timedOut)
 			{
+				ReportAudioThread("the switch timed out after 10 s");
 				SetResult("the game's audio thread did not run the switch within 10 s", true);
 				logger::warn("the game's audio thread did not run the switch within 10 s");
 			}
@@ -1044,7 +1397,9 @@ namespace audioswitch
 		ok &= PatchSlot(vtable, slot::kCreateMasteringVoice, reinterpret_cast<void*>(&HookCreateMastering), reinterpret_cast<void**>(&g_origMaster), "IXAudio2::CreateMasteringVoice");
 		ok &= PatchSlot(vtable, slot::kInitialize, reinterpret_cast<void*>(&HookInitialize), reinterpret_cast<void**>(&g_origInitialize), "IXAudio2::Initialize");
 		ok &= PatchSlot(vtable, slot::kGetDeviceCount, reinterpret_cast<void*>(&HookGetDeviceCount), reinterpret_cast<void**>(&g_origDeviceCount), "IXAudio2::GetDeviceCount");
-		g_hooked = ok && g_origMaster && g_origInitialize && g_origDeviceCount;
+		ok &= PatchSlot(vtable, slot::kCreateSourceVoice, reinterpret_cast<void*>(&HookCreateSource), reinterpret_cast<void**>(&g_origCreateSource), "IXAudio2::CreateSourceVoice");
+		ok &= PatchSlot(vtable, slot::kCreateSubmixVoice, reinterpret_cast<void*>(&HookCreateSubmix), reinterpret_cast<void**>(&g_origCreateSubmix), "IXAudio2::CreateSubmixVoice");
+		g_hooked = ok && g_origMaster && g_origInitialize && g_origDeviceCount && g_origCreateSource && g_origCreateSubmix;
 		g_threadHooked = g_hooked && InstallThreadHook();
 		g_installResult = g_hooked ? std::format("hooked (XAudio2_7.dll at {}, vtable {})", Ptr(module), Ptr(vtable)) : std::string("one or more vtable slots could not be hooked");
 		logger::info("install: {}; {}", g_installResult, g_threadHookResult);
