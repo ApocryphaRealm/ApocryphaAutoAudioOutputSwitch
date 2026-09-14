@@ -191,6 +191,7 @@ namespace audioswitch
 			std::atomic<std::uint64_t> passes{ 0 };
 			std::uint32_t resets{ 0 };
 			std::string lastResult{ "created" };
+			std::chrono::steady_clock::time_point lastSwapAt{};
 		};
 
 		class EngineCallback final : public IXAudio2EngineCallback
@@ -240,6 +241,9 @@ namespace audioswitch
 		std::condition_variable g_wakeCv;
 		bool g_pending{ false };
 		bool g_force{ false };
+		bool g_urgent{ false };
+		std::string g_avoidId;
+		std::chrono::steady_clock::time_point g_urgentAt{};
 		bool g_busy{ false };
 		std::string g_pendingReason;
 		std::string g_lastReason{ "none" };
@@ -247,6 +251,21 @@ namespace audioswitch
 		std::chrono::steady_clock::time_point g_lastEvent{};
 		std::uint32_t g_requests{ 0 };
 		std::uint32_t g_runs{ 0 };
+
+		std::mutex g_currentLock;
+		std::string g_currentId;  // lower-case id of the device the first engine plays on
+
+		void SetCurrentId(const std::string& a_id)
+		{
+			std::scoped_lock l(g_currentLock);
+			g_currentId = Lower(a_id);
+		}
+
+		bool IsCurrentDevice(const std::string& a_id)
+		{
+			std::scoped_lock l(g_currentLock);
+			return !g_currentId.empty() && g_currentId == Lower(a_id);
+		}
 
 		Engine* FindEngine(IXAudio2* a_engine)
 		{
@@ -353,6 +372,8 @@ namespace audioswitch
 			a_engine.master = master;
 			a_engine.deviceId = used->id;
 			a_engine.deviceName = used->name;
+			a_engine.lastSwapAt = std::chrono::steady_clock::now();
+			SetCurrentId(used->id);
 			const HRESULT start = a_engine.engine->StartEngine();
 			std::string restart = std::format("; engine restarted {}, new master {}", Hr(start), Ptr(master));
 			++a_engine.resets;
@@ -362,7 +383,7 @@ namespace audioswitch
 			return SUCCEEDED(attach);
 		}
 
-		void DoResets(const std::string& a_reason, bool a_force)
+		void DoResets(const std::string& a_reason, bool a_force, const std::string& a_avoidId, std::chrono::steady_clock::time_point a_urgentAt)
 		{
 			std::scoped_lock lock(g_lock);
 			if (g_engines.empty())
@@ -375,8 +396,16 @@ namespace audioswitch
 				Engine& e = *owned;
 				if (!e.proxy) { continue; }
 				HRESULT listHr = S_OK;
-				const auto devices = ListDevices(e.engine, listHr);
+				auto devices = ListDevices(e.engine, listHr);
 				LogDevices(devices, listHr, "reset check");
+				if (!a_avoidId.empty())
+				{
+					const auto before = devices.size();
+					std::erase_if(devices, [&](const Device& d) { return Lower(d.id) == Lower(a_avoidId); });
+					const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - a_urgentAt).count();
+					logger::info("urgent switch: {} ms after the notification; the leaving device {} XAudio2's list; engine critical flag already set: {}",
+								 ms, before != devices.size() ? "was still in" : "was already gone from", e.critical.load());
+				}
 
 				const Device* current = nullptr;
 				if (!e.deviceId.empty())
@@ -391,7 +420,21 @@ namespace audioswitch
 				// Measured 2026-09-13 on 1.5.97: after the active device is removed XAudio2 2.7 invalidates the whole engine;
 				// every CreateMasteringVoice on it fails with 0x88960004, and calling into it again was followed by a crash on
 				// XAudio2's own thread. So an engine that reported a critical error is left completely alone.
-				if (critical)
+				if (critical && e.master && std::chrono::steady_clock::now() - e.lastSwapAt < std::chrono::seconds(3))
+				{
+					// The error may belong to the device we just left. Without calling into the engine, see whether it is still mixing.
+					const auto p0 = e.passes.load();
+					std::this_thread::sleep_for(std::chrono::milliseconds(300));
+					const auto p1 = e.passes.load();
+					if (p1 > p0)
+					{
+						e.critical = false;
+						e.lastResult += "; a critical error arrived just after the switch but the engine kept processing - kept";
+						logger::info("engine {}: critical error right after a switch, engine still processing ({} passes in 300 ms) - kept", Ptr(e.engine), p1 - p0);
+						continue;
+					}
+				}
+				if (e.critical)
 				{
 					if (e.lastResult.rfind("engine invalidated", 0) != 0)
 					{
@@ -529,6 +572,7 @@ namespace audioswitch
 				if (d.index == pick)
 				{
 					engine->deviceId = d.id;
+					SetCurrentId(d.id);
 					engine->deviceName = d.name;
 				}
 			}
@@ -644,7 +688,10 @@ namespace audioswitch
 
 			HRESULT STDMETHODCALLTYPE OnDeviceStateChanged(LPCWSTR a_id, DWORD a_state) override
 			{
-				RequestReset(std::format("endpoint {} is now {}", Narrow(a_id), EndpointStateName(a_state)), false);
+				const std::string id = Narrow(a_id);
+				const bool leaving = a_state != DEVICE_STATE_ACTIVE && IsCurrentDevice(id);
+				if (leaving) { logger::info("the game's current device {} is now {}: switching without delay", id, EndpointStateName(a_state)); }
+				RequestReset(std::format("endpoint {} is now {}", id, EndpointStateName(a_state)), false, leaving, leaving ? id : std::string());
 				return S_OK;
 			}
 
@@ -656,7 +703,10 @@ namespace audioswitch
 
 			HRESULT STDMETHODCALLTYPE OnDeviceRemoved(LPCWSTR a_id) override
 			{
-				RequestReset(std::format("endpoint {} removed", Narrow(a_id)), false);
+				const std::string id = Narrow(a_id);
+				const bool leaving = IsCurrentDevice(id);
+				if (leaving) { logger::info("the game's current device {} was removed: switching without delay", id); }
+				RequestReset(std::format("endpoint {} removed", id), false, leaving, leaving ? id : std::string());
 				return S_OK;
 			}
 
@@ -693,10 +743,12 @@ namespace audioswitch
 			{
 				std::string reason;
 				bool force = false;
+				std::string avoid;
+				std::chrono::steady_clock::time_point urgentAt{};
 				{
 					std::unique_lock l(g_wakeLock);
 					g_wakeCv.wait(l, [] { return g_pending; });
-					for (;;)
+					for (; !g_urgent;)
 					{
 						const auto due = g_lastEvent + std::chrono::milliseconds(settings::general::resetDelayMs.load());
 						if (std::chrono::steady_clock::now() >= due) { break; }
@@ -704,6 +756,10 @@ namespace audioswitch
 					}
 					reason = std::move(g_pendingReason);
 					force = g_force;
+					avoid = std::move(g_avoidId);
+					urgentAt = g_urgentAt;
+					g_avoidId.clear();
+					g_urgent = false;
 					g_pendingReason.clear();
 					g_pending = false;
 					g_force = false;
@@ -711,7 +767,7 @@ namespace audioswitch
 					g_lastReason = reason;
 					++g_runs;
 				}
-				if (settings::general::enabled) { DoResets(reason, force); }
+				if (settings::general::enabled) { DoResets(reason, force, avoid, urgentAt); }
 				else { logger::debug("reset requested ({}) but bEnabled is off", reason); }
 				{
 					std::scoped_lock l(g_wakeLock);
@@ -788,7 +844,7 @@ namespace audioswitch
 		std::thread(WorkerMain).detach();
 	}
 
-	void RequestReset(std::string_view a_reason, bool a_force)
+	void RequestReset(std::string_view a_reason, bool a_force, bool a_urgent, std::string_view a_avoidId)
 	{
 		{
 			std::scoped_lock l(g_wakeLock);
@@ -800,6 +856,12 @@ namespace audioswitch
 			g_pending = true;
 			g_force = g_force || a_force;
 			g_lastEvent = std::chrono::steady_clock::now();
+			if (a_urgent)
+			{
+				g_urgent = true;
+				g_avoidId = std::string(a_avoidId);
+				g_urgentAt = g_lastEvent;
+			}
 			++g_requests;
 		}
 		g_wakeCv.notify_all();

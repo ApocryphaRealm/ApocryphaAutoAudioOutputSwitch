@@ -41,7 +41,9 @@ namespace audioswitch
 
 	void Install();                                   // SKSEPluginLoad: pin XAudio2_7.dll and patch the vtable
 	void StartWatcher();                              // SKSEPluginLoad: endpoint notifications + the reset worker
-	void RequestReset(std::string_view a_reason, bool a_force);
+	// a_urgent skips the settle delay (the current device just stopped: switch before XAudio2 invalidates the engine);
+	// a_avoidId is a device to leave out of the choice (the one that is going away).
+	void RequestReset(std::string_view a_reason, bool a_force, bool a_urgent = false, std::string_view a_avoidId = {});
 	bool WaitIdle(int a_timeoutMs);                   // for the DevBench tool: true once no reset is pending or running
 	std::string StateJson();                          // engines, hooks, counters
 	std::string DevicesJson();                        // XAudio2 device list (from a live engine) and Windows endpoints
