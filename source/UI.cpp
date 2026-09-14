@@ -99,7 +99,7 @@ namespace UI
 			}
 			if (s.critical)
 			{
-				ImGuiMCP::TextWrapped("%s", strings::TR("AAIS_StatusInvalidated", "Sound stopped because its output device was removed. It cannot be restored in this session - restart the game to get sound back."));
+				ImGuiMCP::TextWrapped("%s", strings::TR("AAIS_StatusInvalidated", "The output device stopped working. Switching to another connected device..."));
 			}
 			else if (s.attached)
 			{

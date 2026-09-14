@@ -4,27 +4,34 @@ An SKSE plugin for Skyrim Special Edition 1.5.97, Anniversary Edition 1.6.1170 a
 move to another audio output device without a restart.
 
 Skyrim chooses its output device once, at startup, and goes silent for the rest of the session if that device is
-unplugged. With this plugin the game switches:
+unplugged. With this plugin the game moves its sound:
 
-- to the Windows default output when the active device is removed or the default changes
-  (`bSwitchOnDefaultChange=1`), and
-- to a preferred device whenever it is connected (`sPreferredDevice`, part of the device's name).
+- to another connected device when the one it plays on is unplugged, disabled or stops working,
+- to the Windows default output when the default changes (`bSwitchOnDefaultChange=1`),
+- to a preferred device whenever it is connected (`sPreferredDevice`, part of the device's name), and
+- on demand, with Switch now on the settings page.
 
-Settings: `SKSE/Plugins/ApocryphaAutoAudioInputSwitch.ini`. Log:
+Settings: the Auto Audio Input Switch page in the Apocrypha Menu Framework (or SKSE Menu Framework), or
+`SKSE/Plugins/ApocryphaAutoAudioInputSwitch.ini`. Log:
 `Documents/My Games/Skyrim Special Edition/SKSE/ApocryphaAutoAudioInputSwitch.log`.
 
 ## How it works
 
-Every Skyrim runtime plays audio through XAudio2 2.7. The plugin pins `XAudio2_7.dll` and hooks four slots of the
-IXAudio2 interface table, which all engine instances share. When the game creates its mastering voice, the real one
-is created on the chosen device and a submix voice is given to the game in its place; every sound the game plays sends
-to that stand-in. Switching destroys the real mastering voice and creates a new one on the target device, then
-reconnects the stand-in - the game's own voices are never touched. Switches are triggered by Windows audio endpoint
-notifications and by the engine's critical-error callback, debounced, on a worker thread. See
-`include/AudioSwitch.h`.
+Every Skyrim runtime plays audio through XAudio2 2.7, and XAudio2 2.7 cannot move an engine to another device: once its
+device is gone the engine is dead. So a switch rebuilds the game's own audio engine. On the game's audio thread,
+between sound-processing passes, every live sound lets go of its voice, the game's own audio shutdown and init run
+(init creates the new engine on the target device), and the game's own per-sound setup gives every sound a voice on the
+new engine. Switches are triggered by Windows audio endpoint notifications and by the engine's device-loss callback;
+a newly connected device is probed until it actually takes audio. Game functions are located through Address Library
+IDs, confirmed in the 1.5.97 and 1.7.104 code. See `include/AudioSwitch.h`.
 
-This is a clean-room implementation written from the public description of Parapets' Auto Audio Switch; none of that
-mod's code was read or used.
+Long streamed tracks (music, dialogue) restart from their beginning after a switch; short and looping sounds carry on.
+
+## Credits
+
+- **Live Audio Output Switching SE** by Maarten Harms (MIT) - the rebuild procedure this plugin follows, found for
+  1.5.97 and ported here to three game versions. Its licence notice is in `THIRD_PARTY_NOTICES.md`.
+- **Parapets** - Auto Audio Switch for Anniversary Edition, the original idea. None of its files were read here.
 
 ## Building
 
