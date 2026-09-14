@@ -1,4 +1,4 @@
-// Auto Audio Input Switch - own code, GPL-3.0-or-later (2026-09-13). Moves Skyrim's audio to another output device
+// Auto Audio Output Switch - own code, GPL-3.0-or-later (2026-09-13). Moves Skyrim's audio to another output device
 // without a restart: when a preferred device is chosen, when the active device is removed or a new one appears, and
 // when the Windows default output changes. Works at the XAudio2 2.7 COM layer every runtime shares - no game
 // address, no ESP, no scripts.
@@ -22,7 +22,7 @@ namespace
 			DevBenchTool::Init(false);
 			break;
 		case SKSE::MessagingInterface::kDataLoaded:
-			strings::Configure("ApocryphaAutoAudioInputSwitch");
+			strings::Configure("ApocryphaAutoAudioOutputSwitch");
 			UI::Register();
 			DevBenchTool::Init(true);
 			audioswitch::LogSummary("data loaded");
@@ -38,13 +38,13 @@ namespace
 SKSEPluginLoad(const SKSE::LoadInterface* a_skse)
 {
 	SKSE::Init(a_skse);
-	SKSE::log::init("ApocryphaAutoAudioInputSwitch");
+	SKSE::log::init("ApocryphaAutoAudioOutputSwitch");
 
-	settings::Init("ApocryphaAutoAudioInputSwitch.ini");
+	settings::Init("ApocryphaAutoAudioOutputSwitch.ini");
 	settings::ApplyLogLevel();
-	SKSE::log::describe_level("ApocryphaAutoAudioInputSwitch.ini");
+	SKSE::log::describe_level("ApocryphaAutoAudioOutputSwitch.ini");
 
-	logger::info("Auto Audio Input Switch {} loading", SKSE::PluginDeclaration::GetSingleton()->GetVersion().string("."));
+	logger::info("Auto Audio Output Switch {} loading", SKSE::PluginDeclaration::GetSingleton()->GetVersion().string("."));
 
 	audioswitch::Install();
 	audioswitch::StartWatcher();

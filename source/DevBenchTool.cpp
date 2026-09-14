@@ -145,14 +145,14 @@ namespace DevBenchTool
 		DevBenchAPI::IDevBenchInterface001* devBench = DevBenchAPI::GetDevBenchInterface001();
 		if (!devBench)
 		{
-			if (a_lastAttempt) { logger::info("DevBench not detected; skipping the \"aais.control\" tool"); }
+			if (a_lastAttempt) { logger::info("DevBench not detected; skipping the \"aaos.control\" tool"); }
 			else { logger::debug("DevBench not detected yet; will retry at the next message"); }
 			return;
 		}
 
 		constexpr const char* descriptor =
 			"{"
-			"\"description\":\"Auto Audio Input Switch live state and driver. op=state (default): settings, hooks, worker, every managed "
+			"\"description\":\"Auto Audio Output Switch live state and driver. op=state (default): settings, hooks, worker, every managed "
 			"XAudio2 engine (device, attached, processing passes, critical errors, resets, last result). op=devices: the XAudio2 device list "
 			"and the Windows render endpoints with state and default. op=check runs a reset check now (switches only if needed); op=reset "
 			"forces a switch to the target device. op=prefer name=\\\"...\\\" sets the preferred device (part of a name, a full id, or empty) "
@@ -162,9 +162,9 @@ namespace DevBenchTool
 			"\"readOnly\":false"
 			"}";
 
-		if (devBench->RegisterTool("aais.control", descriptor, &ControlTool, nullptr))
+		if (devBench->RegisterTool("aaos.control", descriptor, &ControlTool, nullptr))
 		{
-			logger::info("Registered \"aais.control\" with DevBench (build {})", devBench->GetBuildNumber());
+			logger::info("Registered \"aaos.control\" with DevBench (build {})", devBench->GetBuildNumber());
 			registered = true;
 		}
 	}

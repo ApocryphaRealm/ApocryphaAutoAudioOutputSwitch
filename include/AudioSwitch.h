@@ -1,6 +1,6 @@
 #pragma once
 
-// Auto Audio Input Switch - GPL-3.0-or-later (2026-09-13).
+// Auto Audio Output Switch - GPL-3.0-or-later (2026-09-13).
 //
 // How the game's audio moves to another device without a restart, on SE 1.5.97, AE 1.6.1170 and Skyrim 1.7.x (all
 // XAudio2 2.7):

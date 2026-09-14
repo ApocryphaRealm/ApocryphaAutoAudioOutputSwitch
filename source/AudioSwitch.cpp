@@ -1,4 +1,4 @@
-// Auto Audio Input Switch - GPL-3.0-or-later (2026-09-13).
+// Auto Audio Output Switch - GPL-3.0-or-later (2026-09-13).
 //
 // The device switch rebuilds the game's own audio engine on the game's audio thread. That procedure follows
 // Live Audio Output Switching SE by Maarten Harms (MIT; its notice is in THIRD_PARTY_NOTICES.md), which found it

@@ -1,6 +1,6 @@
 #pragma once
 
-// Auto Audio Input Switch - own code, GPL-3.0-or-later (2026-09-13).
+// Auto Audio Output Switch - own code, GPL-3.0-or-later (2026-09-13).
 // The XAudio2 2.7 COM interfaces Skyrim uses on every runtime (XAudio2_7.dll), declared from their published ABI:
 // method order, the pack(1) structures and the 2.7 CLSID/IID. The Windows SDK only ships XAudio2 2.8+, whose
 // interfaces differ, and the June 2010 DirectX SDK is not a build dependency of this project.

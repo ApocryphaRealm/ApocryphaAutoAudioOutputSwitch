@@ -1,4 +1,4 @@
-# Auto Audio Input Switch - copyright and licence
+# Auto Audio Output Switch - copyright and licence
 
 Copyright (C) 2026 ApocryphaRealm
 
@@ -27,7 +27,8 @@ Components under other licences, with their notices: `THIRD_PARTY_NOTICES.md`.
 
 Written for this project. The idea is Parapets' Auto Audio Switch (Nexus mod 134404), known here from its public
 description only; none of its files were read. The device-switch procedure - rebuilding the game's own audio engine on
-its audio thread and reviving each live sound - follows Live Audio Output Switching SE by Maarten Harms (MIT, notice
-in `THIRD_PARTY_NOTICES.md`), ported to three game versions.
+its audio thread and reviving each live sound - is built on Live Audio Output Switching SE by Mern (Maarten Harms) - MIT,
+https://www.nexusmods.com/skyrimspecialedition/mods/184853, notice in `THIRD_PARTY_NOTICES.md` - ported to three game
+versions.
 
-Source code: https://github.com/ApocryphaRealm/ApocryphaAutoAudioInputSwitch
+Source code: https://github.com/ApocryphaRealm/ApocryphaAutoAudioOutputSwitch

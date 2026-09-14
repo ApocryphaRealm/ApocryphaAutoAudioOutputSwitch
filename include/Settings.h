@@ -1,6 +1,6 @@
 #pragma once
 
-// Auto Audio Input Switch - settings. Plain-file INI (redirector-proof, the project standard).
+// Auto Audio Output Switch - settings. Plain-file INI (redirector-proof, the project standard).
 
 #include <atomic>
 #include <cstdint>

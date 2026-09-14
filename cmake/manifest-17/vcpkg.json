@@ -1,8 +1,8 @@
 {
-    "name": "apocryphaautoaudioinputswitch-17",
+    "name": "apocryphaautoaudiooutputswitch-17",
     "version-string": "1.0.0",
-    "description": "Auto Audio Input Switch - Skyrim's audio follows your output device: pick a preferred device, and the game switches when devices are plugged in, removed or the Windows default changes, without a restart. [Skyrim 1.7.x build line: CommonLibSSE-NG 7.2.0, cmake/ports-17]",
-    "homepage": "https://github.com/ApocryphaRealm/ApocryphaAutoAudioInputSwitch",
+    "description": "Auto Audio Output Switch - Skyrim's audio follows your output device: pick a preferred device, and the game switches when devices are plugged in, removed or the Windows default changes, without a restart. [Skyrim 1.7.x build line: CommonLibSSE-NG 7.2.0, cmake/ports-17]",
+    "homepage": "https://github.com/ApocryphaRealm/ApocryphaAutoAudioOutputSwitch",
     "license": "GPL-3.0-or-later",
     "dependencies": [
         "commonlibsse-ng",
