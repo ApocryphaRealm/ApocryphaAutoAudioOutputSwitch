@@ -996,6 +996,127 @@ namespace audioswitch
 			return hr;
 		}
 
+		// ---- XAudio2 2.7's own deadlock on device removal ----
+		// When the device an engine plays on disappears, two XAudio2 threads can both call LEAPCORE::CLeapSystem::OnCriticalError:
+		// the audio session's disconnect callback, and the engine's graph (processing) thread, which found the device gone itself.
+		// OnCriticalError takes the CLeapSystem critical section (this+0x88) and, when the caller is not the graph thread, calls
+		// StopGraph while holding it - StopGraph sets the graph thread's stop event and waits, without a timeout, for that thread to
+		// exit. The graph thread's call is the last thing it does before exiting, and it blocks on the same critical section: a
+		// deadlock inside XAudio2. The game's audio thread then blocks in IXAudio2SourceVoice::GetState and the game stops
+		// responding. Found from a Task Manager dump with Microsoft's public symbols (falsification episode 51); the unplug hangs
+		// first blamed on this mod's DestroyVoice (episodes 46 and 48) were this same race.
+		// The guard (XAudio2_7 9.29.1962, June 2010 - the build Skyrim installs - verified before patching): on the graph thread,
+		// OnCriticalError takes the critical section with TryEnterCriticalSection and calls the original while holding it (the
+		// section is recursive). If another thread holds it and has already recorded the error (this+0xB8), that thread is stopping
+		// the graph and waiting for this one, so the call returns and the thread exits; the error is still reported by the other
+		// thread. XAudio2's own logic is unchanged when the two paths do not collide.
+		constexpr DWORD kXa27TimeStamp = 0x4C0643CC;
+		constexpr DWORD kXa27ImageSize = 0x8B000;
+		constexpr std::uintptr_t kXa27SlotRva = 0x224E8;       // ILeapCallback-side vtable slot holding CLeapSystem::OnCriticalError
+		constexpr std::uintptr_t kXa27OnCriticalErrorRva = 0x2EB80;
+		constexpr std::uintptr_t kLeapCritSec = 0x88;          // CCriticalSectionLock at +0x80, its CRITICAL_SECTION at +8
+		constexpr std::uintptr_t kLeapError = 0xB8;            // first critical error (lock cmpxchg)
+		constexpr std::uintptr_t kLeapGraph = 0xC8;            // graph manager; its thread id at +0x18
+
+		using LeapOnCriticalErrorFn = void (*)(void*, HRESULT);
+		LeapOnCriticalErrorFn g_origLeapOnCriticalError{ nullptr };
+		std::atomic<std::uint32_t> g_leapCollisions{ 0 };
+		std::string g_leapGuardResult{ "not installed" };
+
+		DWORD LeapGraphThread(void* a_system)
+		{
+			__try
+			{
+				void* graph = *reinterpret_cast<void**>(static_cast<std::uint8_t*>(a_system) + kLeapGraph);
+				return graph ? *reinterpret_cast<DWORD*>(static_cast<std::uint8_t*>(graph) + 0x18) : 0;
+			}
+			__except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+		}
+
+		void LeapOnCriticalErrorHook(void* a_system, HRESULT a_error)
+		{
+			const DWORD graphTid = a_system ? LeapGraphThread(a_system) : 0;
+			if (graphTid != 0 && GetCurrentThreadId() == graphTid)
+			{
+				auto* cs = reinterpret_cast<CRITICAL_SECTION*>(static_cast<std::uint8_t*>(a_system) + kLeapCritSec);
+				const auto* recorded = reinterpret_cast<const LONG*>(static_cast<std::uint8_t*>(a_system) + kLeapError);
+				for (int i = 0; i < 2000; ++i)
+				{
+					if (TryEnterCriticalSection(cs))
+					{
+						g_origLeapOnCriticalError(a_system, a_error);
+						LeaveCriticalSection(cs);
+						return;
+					}
+					if (*recorded != 0)
+					{
+						const auto n = g_leapCollisions.fetch_add(1) + 1;
+						logger::warn("XAudio2 deadlock avoided: its graph thread reported the lost device (0x{:08X}) while another XAudio2 thread "
+									 "was already handling it (0x{:08X}) and waiting for the graph thread to stop; the graph thread now exits instead of "
+									 "waiting for that thread ({} so far)",
+							static_cast<std::uint32_t>(a_error), static_cast<std::uint32_t>(*recorded), n);
+						return;
+					}
+					Sleep(1);
+				}
+			}
+			g_origLeapOnCriticalError(a_system, a_error);
+		}
+
+		bool BytesMatch(std::uintptr_t a_addr, std::initializer_list<int> a_bytes)
+		{
+			__try
+			{
+				const auto* p = reinterpret_cast<const std::uint8_t*>(a_addr);
+				std::size_t i = 0;
+				for (const int b : a_bytes)
+				{
+					if (b >= 0 && p[i] != static_cast<std::uint8_t>(b)) { return false; }
+					++i;
+				}
+				return true;
+			}
+			__except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+		}
+
+		void InstallLeapGuard(HMODULE a_module)
+		{
+			const auto base = reinterpret_cast<std::uintptr_t>(a_module);
+			const auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
+			const auto* nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
+			if (nt->FileHeader.TimeDateStamp != kXa27TimeStamp || nt->OptionalHeader.SizeOfImage != kXa27ImageSize)
+			{
+				g_leapGuardResult = std::format("not installed: XAudio2_7.dll is not the June 2010 build it was written for (timestamp 0x{:08X}, image size 0x{:X})",
+					nt->FileHeader.TimeDateStamp, nt->OptionalHeader.SizeOfImage);
+				logger::warn("XAudio2 deadlock guard {}", g_leapGuardResult);
+				return;
+			}
+			const std::uintptr_t fn = base + kXa27OnCriticalErrorRva;
+			const bool bytes =
+				BytesMatch(fn, { 0x48, 0x89, 0x5C, 0x24, 0x08, 0x48, 0x89, 0x6C, 0x24, 0x10, 0x48, 0x89, 0x74, 0x24, 0x18, 0x57, 0x48, 0x83, 0xEC, 0x20, 0x48, 0x8B, 0x81, 0x80, 0x00, 0x00, 0x00 }) &&
+				BytesMatch(fn + 0x29, { 0xF0, 0x0F, 0xB1, 0xAF, 0xB8, 0x00, 0x00, 0x00 }) &&           // lock cmpxchg [rdi+0B8h],ebp
+				BytesMatch(fn + 0x3B, { 0x48, 0x8B, 0x87, 0xC8, 0x00, 0x00, 0x00, 0x8B, 0x58, 0x18 });  // mov rax,[rdi+0C8h]; mov ebx,[rax+18h]
+			void** slot = reinterpret_cast<void**>(base + kXa27SlotRva);
+			if (!bytes || static_cast<void*>(*slot) != reinterpret_cast<void*>(fn))
+			{
+				g_leapGuardResult = "not installed: CLeapSystem::OnCriticalError or its vtable slot did not match the expected code";
+				logger::warn("XAudio2 deadlock guard {}", g_leapGuardResult);
+				return;
+			}
+			DWORD old = 0;
+			if (!VirtualProtect(slot, sizeof(void*), PAGE_READWRITE, &old))
+			{
+				g_leapGuardResult = std::format("not installed: the vtable slot could not be made writable (error {})", GetLastError());
+				logger::warn("XAudio2 deadlock guard {}", g_leapGuardResult);
+				return;
+			}
+			g_origLeapOnCriticalError = reinterpret_cast<LeapOnCriticalErrorFn>(*slot);
+			*slot = reinterpret_cast<void*>(&LeapOnCriticalErrorHook);
+			VirtualProtect(slot, sizeof(void*), old, &old);
+			g_leapGuardResult = "installed (XAudio2_7 9.29.1962)";
+			logger::info("XAudio2 deadlock guard installed: CLeapSystem::OnCriticalError on the graph thread no longer waits for a thread that waits for it");
+		}
+
 		// ---- StartEngine / StopEngine from other mods ----
 		// Called on an engine AAOS keeps alive for another mod (pinned: that mod's hook was repaired, so its cached pointer
 		// never moves on), the call is passed to the engine that is playing, so the mod keeps working - Better AltTab's
@@ -1895,6 +2016,7 @@ namespace audioswitch
 		}
 		HMODULE pinned = nullptr;
 		GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_PIN, L"XAudio2_7.dll", &pinned);  // the game frees it on every rebuild
+		InstallLeapGuard(module);
 
 		void** vtable = nullptr;
 		HRESULT created = E_FAIL;
@@ -2026,12 +2148,12 @@ namespace audioswitch
 		}
 		std::scoped_lock l(g_wakeLock);
 		return std::format(
-			"\"hooks\":{{\"installed\":{},\"result\":\"{}\",\"audioThread\":{},\"audioThreadResult\":\"{}\",\"initializeCalls\":{},\"deviceCountCalls\":{},\"voiceGuard\":\"{}\",\"soundsSkippedNoEngine\":{},\"heldEngines\":{},\"pinnedEngines\":{},\"createCall\":\"{}\",\"otherModEngine\":\"{}\"}},"
+			"\"hooks\":{{\"installed\":{},\"result\":\"{}\",\"audioThread\":{},\"audioThreadResult\":\"{}\",\"initializeCalls\":{},\"deviceCountCalls\":{},\"voiceGuard\":\"{}\",\"soundsSkippedNoEngine\":{},\"heldEngines\":{},\"pinnedEngines\":{},\"createCall\":\"{}\",\"otherModEngine\":\"{}\",\"xaudio2DeadlockGuard\":\"{}\",\"xaudio2DeadlocksAvoided\":{}}},"
 			"\"worker\":{{\"result\":\"{}\",\"pending\":{},\"busy\":{},\"swapPending\":{},\"requests\":{},\"runs\":{},\"lastReason\":\"{}\"}},"
 			"\"engines\":[{{\"audioObject\":\"{}\",\"engine\":\"{}\",\"master\":\"{}\",\"attached\":{},\"device\":\"{}\",\"deviceId\":\"{}\",\"channels\":{},\"rate\":{},"
 			"\"passes\":{},\"critical\":{},\"criticalErrors\":{},\"resets\":{},\"failures\":{},\"lastResult\":\"{}\"}}]",
 			g_hooked.load() ? "true" : "false", EscapeJson(g_installResult), g_threadHooked.load() ? "true" : "false", EscapeJson(g_threadHookResult),
-			g_initializeCalls.load(), g_deviceCountCalls.load(), EscapeJson(g_voiceGuardResult), g_nullEngineSkips.load(), g_heldCount.load(), g_pinnedEngines.size(), EscapeJson(g_createCallState), OtherModEngineText(), EscapeJson(g_watcherResult), g_pending ? "true" : "false", g_busy ? "true" : "false",
+			g_initializeCalls.load(), g_deviceCountCalls.load(), EscapeJson(g_voiceGuardResult), g_nullEngineSkips.load(), g_heldCount.load(), g_pinnedEngines.size(), EscapeJson(g_createCallState), OtherModEngineText(), EscapeJson(g_leapGuardResult), g_leapCollisions.load(), EscapeJson(g_watcherResult), g_pending ? "true" : "false", g_busy ? "true" : "false",
 			g_swapPending.load() ? "true" : "false", g_requests, g_runs, EscapeJson(g_lastReason), Ptr(snap.audio), Ptr(snap.engine), Ptr(snap.master),
 			snap.master ? "true" : "false", EscapeJson(snap.deviceName), EscapeJson(snap.deviceId), snap.channels, snap.rate, g_passes.load(),
 			g_critical.load() ? "true" : "false", g_criticalCount.load(), snap.switches, snap.failures, EscapeJson(snap.lastResult));
