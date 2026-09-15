@@ -2,12 +2,18 @@
 
 #include "DevBenchTool.h"
 
+#include "KeyboardAccess.h"
+
 #include "AudioSwitch.h"
 #include "DevBench/DevBenchAPI.h"
 #include "Settings.h"
+#include "Volume.h"
 #include "utils/Logger.h"
 
+#include <algorithm>
+#include <chrono>
 #include <format>
+#include <thread>
 #include <string>
 #include <string_view>
 
@@ -63,15 +69,15 @@ namespace DevBenchTool
 		std::string SettingsJson()
 		{
 			return std::format(
-				"\"settings\":{{\"enabled\":{},\"preferredDevice\":\"{}\",\"switchOnDefaultChange\":{},\"resetDelayMs\":{},\"logLevel\":{},\"iniPath\":\"{}\"}}",
+				"\"settings\":{{\"enabled\":{},\"preferredDevice\":\"{}\",\"switchOnDefaultChange\":{},\"switchToNewDevice\":{},\"resetDelayMs\":{},\"logLevel\":{},\"iniPath\":\"{}\"}}",
 				settings::general::enabled ? "true" : "false", EscapeJson(settings::GetPreferredDevice()),
-				settings::general::switchOnDefaultChange ? "true" : "false", settings::general::resetDelayMs.load(), settings::debug::logLevel,
+				settings::general::switchOnDefaultChange ? "true" : "false", settings::general::switchToNewDevice ? "true" : "false", settings::general::resetDelayMs.load(), settings::debug::logLevel,
 				EscapeJson(settings::GetIniPath()));
 		}
 
 		std::string StateReply(const char* a_op, bool a_ok, std::string_view a_extra = {})
 		{
-			return std::format("{{\"ok\":{},\"op\":\"{}\",{},{}{}}}", a_ok ? "true" : "false", a_op, SettingsJson(), audioswitch::StateJson(), a_extra);
+			return std::format("{{\"ok\":{},\"op\":\"{}\",{},{},{},{}{}}}", a_ok ? "true" : "false", a_op, SettingsJson(), audioswitch::StateJson(), volume::StateJson(), mediakeys::StateJson(), a_extra);
 		}
 
 		void ControlTool(void*, const char* a_argsJson, void* a_sink, DevBenchAPI::WriteFn a_write)
@@ -115,13 +121,47 @@ namespace DevBenchTool
 				if (present) { settings::general::enabled = (v == "true" || v == "1"); changed = true; }
 				v = Get(args, "switchOnDefaultChange", &present);
 				if (present) { settings::general::switchOnDefaultChange = (v == "true" || v == "1"); changed = true; }
+				v = Get(args, "switchToNewDevice", &present);
+				if (present) { settings::general::switchToNewDevice = (v == "true" || v == "1"); changed = true; }
+				v = Get(args, "mediaKeys", &present);
+				if (present) { settings::keyboard::mediaKeys = (v == "true" || v == "1"); changed = true; }
+				v = Get(args, "disableWindowsKey", &present);
+				if (present) { settings::keyboard::disableWindowsKey = (v == "true" || v == "1"); changed = true; }
+				v = Get(args, "disableDeadKeys", &present);
+				if (present) { settings::keyboard::disableDeadKeys = (v == "true" || v == "1"); changed = true; }
 				v = Get(args, "resetDelayMs", &present);
 				if (present)
 				{
 					try { settings::general::resetDelayMs = std::min<std::uint32_t>(static_cast<std::uint32_t>(std::stoul(v)), 10000u); changed = true; } catch (...) {}
 				}
 				const bool saved = changed && settings::Save();
-				a_write(a_sink, StateReply("set", saved, changed ? "" : ",\"error\":\"nothing to set (enabled, switchOnDefaultChange, resetDelayMs)\"").c_str());
+				a_write(a_sink, StateReply("set", saved, changed ? "" : ",\"error\":\"nothing to set (enabled, switchOnDefaultChange, switchToNewDevice, resetDelayMs, mediaKeys, disableWindowsKey, disableDeadKeys)\"").c_str());
+				return;
+			}
+			if (op == "volume")
+			{
+				bool present = false;
+				bool changed = false;
+				std::string v = Get(args, "level", &present);
+				if (present)
+				{
+					try
+					{
+						volume::SetLevel(std::clamp(std::stof(v), 0.0F, 100.0F) / 100.0F);
+						changed = true;
+					}
+					catch (...)
+					{
+					}
+				}
+				v = Get(args, "mute", &present);
+				if (present)
+				{
+					volume::SetMuted(v == "true" || v == "1");
+					changed = true;
+				}
+				if (changed) { std::this_thread::sleep_for(std::chrono::milliseconds(400)); }
+				a_write(a_sink, std::format("{{\"ok\":{},\"op\":\"volume\",{}}}", volume::Get().ok ? "true" : "false", volume::StateJson()).c_str());
 				return;
 			}
 			if (op == "reload")
@@ -156,9 +196,9 @@ namespace DevBenchTool
 			"XAudio2 engine (device, attached, processing passes, critical errors, resets, last result). op=devices: the XAudio2 device list "
 			"and the Windows render endpoints with state and default. op=check runs a reset check now (switches only if needed); op=reset "
 			"forces a switch to the target device. op=prefer name=\\\"...\\\" sets the preferred device (part of a name, a full id, or empty) "
-			"and checks. op=set with enabled / switchOnDefaultChange / resetDelayMs. op=reload re-reads the INI and checks.\","
+			"and checks. op=set with enabled / switchOnDefaultChange / switchToNewDevice / resetDelayMs, or mediaKeys / disableWindowsKey / disableDeadKeys (saved; the keyboard ones apply at the next game start - state reports mediaKeys status). op=volume [level=0-100] [mute=true|false]: read or set the Windows volume and mute of the device the game plays on. op=reload re-reads the INI and checks.\","
 			"\"inputSchema\":{\"type\":\"object\",\"properties\":{\"op\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"},"
-			"\"enabled\":{\"type\":\"boolean\"},\"switchOnDefaultChange\":{\"type\":\"boolean\"},\"resetDelayMs\":{\"type\":\"integer\"}}},"
+			"\"enabled\":{\"type\":\"boolean\"},\"switchOnDefaultChange\":{\"type\":\"boolean\"},\"switchToNewDevice\":{\"type\":\"boolean\"},\"mediaKeys\":{\"type\":\"boolean\"},\"disableWindowsKey\":{\"type\":\"boolean\"},\"disableDeadKeys\":{\"type\":\"boolean\"},\"level\":{\"type\":\"number\"},\"mute\":{\"type\":\"boolean\"},\"resetDelayMs\":{\"type\":\"integer\"}}},"
 			"\"readOnly\":false"
 			"}";
 

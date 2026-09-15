@@ -6,13 +6,17 @@
 #include "SKSEMenuFramework.h"
 
 #include "AudioSwitch.h"
+#include "KeyboardAccess.h"
 #include "Settings.h"
+#include "Volume.h"
 
 #include "utils/Logger.h"
 #include "utils/Strings.h"
 #include "utils/Toggle.h"
 
 #include <algorithm>
+#include <chrono>
+#include <cmath>
 #include <functional>
 #include <string>
 #include <vector>
@@ -63,9 +67,10 @@ namespace UI
 			if (ImGuiMCP::IsItemHovered()) { ImGuiMCP::SetTooltip("%s", a_description); }
 		}
 
-		bool NudgeableSlider(const char* a_label, float* a_value, float a_min, float a_max, const char* a_format, float a_step)
+		bool NudgeableSlider(const char* a_label, float* a_value, float a_min, float a_max, const char* a_format, float a_step, bool* a_active = nullptr)
 		{
 			bool changed = ImGuiMCP::SliderFloat(a_label, a_value, a_min, a_max, a_format);
+			if (a_active) { *a_active = ImGuiMCP::IsItemActive(); }
 			if (ImGuiMCP::IsItemClicked() || ImGuiMCP::IsItemActive()) { selectedSlider = a_label; }
 			if (selectedSlider == a_label)
 			{
@@ -117,6 +122,46 @@ namespace UI
 				statusMessage = strings::TR("AAOS_StatusSwitching", "Switching to the preferred or default device...");
 			}
 			HelpMarker(strings::TR("AAOS_HelpSwitchNow", "Moves the game's sound to the preferred device, or to the Windows default device when none is set, even if nothing changed."));
+		}
+
+		// PC volume (the owner, 2026-09-14: "change pc volume in game"): the Windows volume and mute of the device the game
+		// plays on, read and set by the volume thread (Volume.h). A value the player just set is shown until the device reports it.
+		void RenderVolumeSection()
+		{
+			ImGuiMCP::SeparatorText(strings::TR("AAOS_Volume", "PC volume"));
+			const volume::Info v = volume::Get();
+			if (!v.ok)
+			{
+				ImGuiMCP::TextWrapped("%s", strings::TR("AAOS_VolumeUnavailable", "The PC volume of the output device cannot be read right now."));
+				return;
+			}
+			const auto now = std::chrono::steady_clock::now();
+
+			static float s_level = 0.0F;
+			static bool s_levelActive = false;
+			static std::chrono::steady_clock::time_point s_levelChanged{};
+			if (!s_levelActive && now - s_levelChanged > std::chrono::milliseconds(600)) { s_level = std::round(v.level * 100.0F); }
+			bool active = false;
+			if (NudgeableSlider(strings::TR("AAOS_VolumeLevel", "Volume"), &s_level, 0.0F, 100.0F, "%.0f %%", 2.0F, &active))
+			{
+				volume::SetLevel(s_level / 100.0F);
+				s_levelChanged = now;
+			}
+			s_levelActive = active;
+			HelpMarker(strings::TR("AAOS_HelpVolume", "The Windows volume of the device the game is playing on, the same one the taskbar's speaker icon sets. It changes that device's volume for everything on the PC, not only the game."));
+
+			static int s_mutePending = -1;
+			static std::chrono::steady_clock::time_point s_muteChanged{};
+			bool muted = v.muted;
+			if (s_mutePending >= 0 && now - s_muteChanged < std::chrono::milliseconds(600)) { muted = s_mutePending == 1; }
+			else { s_mutePending = -1; }
+			if (ImGuiMCP::Toggle(strings::TR("AAOS_Mute", "Mute"), &muted))
+			{
+				volume::SetMuted(muted);
+				s_mutePending = muted ? 1 : 0;
+				s_muteChanged = now;
+			}
+			HelpMarker(strings::TR("AAOS_HelpMute", "Mutes the device the game is playing on, the same as muting it in Windows."));
 		}
 
 		void RenderDeviceSection()
@@ -171,12 +216,53 @@ namespace UI
 			}
 			HelpMarker(strings::TR("AAOS_HelpFollowDefault", "When the preferred device is not connected, switch whenever the Windows default output changes. Off stays on the current device until it is removed."));
 
+			bool arrive = general::switchToNewDevice;
+			if (ImGuiMCP::Toggle(strings::TR("AAOS_SwitchToNew", "Switch to a device connected while playing"), &arrive))
+			{
+				general::switchToNewDevice = arrive;
+			}
+			HelpMarker(strings::TR("AAOS_HelpSwitchToNew", "When an output device is connected after the game has started - a headset plugged in or switched on - the game's sound moves to it. A connected preferred device still comes first."));
+
 			float delay = static_cast<float>(general::resetDelayMs.load());
 			if (NudgeableSlider(strings::TR("AAOS_Delay", "Switch delay"), &delay, 0.0F, 5000.0F, "%.0f ms", 100.0F))
 			{
 				general::resetDelayMs = static_cast<std::uint32_t>(delay);
 			}
 			HelpMarker(strings::TR("AAOS_HelpDelay", "How long to wait after a device change before switching. Windows reports one change as several events; the wait lets them settle."));
+		}
+
+		// Media keys in game (KeyboardAccess.h; approach from Media Keys Fix SKSE). Read at plugin load: changes apply next start.
+		void RenderKeyboardSection()
+		{
+			using namespace settings;
+			ImGuiMCP::SeparatorText(strings::TR("AAOS_Keyboard", "Keyboard"));
+			switch (mediakeys::GetStatus())
+			{
+			case mediakeys::Status::kActive:
+				ImGuiMCP::TextWrapped("%s", strings::TR("AAOS_MediaKeysOn", "Active: Windows handles the media keys."));
+				break;
+			case mediakeys::Status::kOtherMod:
+				ImGuiMCP::TextWrapped("%s", strings::TR("AAOS_MediaKeysOtherMod", "Media Keys Fix SKSE is installed and handles this."));
+				break;
+			case mediakeys::Status::kFailed:
+				ImGuiMCP::TextWrapped("%s", strings::TR("AAOS_MediaKeysFailed", "Could not be applied to this game version. See the log for why."));
+				break;
+			default:
+				ImGuiMCP::TextWrapped("%s", strings::TR("AAOS_MediaKeysOff", "Off: the game keeps the keyboard to itself."));
+				break;
+			}
+
+			bool media = keyboard::mediaKeys;
+			if (ImGuiMCP::Toggle(strings::TR("AAOS_MediaKeys", "Media keys work in game"), &media)) { keyboard::mediaKeys = media; }
+			HelpMarker(strings::TR("AAOS_HelpMediaKeys", "Skyrim normally takes the keyboard for itself, so Windows ignores the volume, mute and other media keys while you play. On lets Windows handle them, the way Media Keys Fix SKSE does. Applies the next time the game starts."));
+
+			bool windowsKey = keyboard::disableWindowsKey;
+			if (ImGuiMCP::Toggle(strings::TR("AAOS_DisableWinKey", "Disable the Windows key"), &windowsKey)) { keyboard::disableWindowsKey = windowsKey; }
+			HelpMarker(strings::TR("AAOS_HelpDisableWinKey", "Keeps the Windows key from opening the Start menu while you play. Applies the next time the game starts."));
+
+			bool deadKeys = keyboard::disableDeadKeys;
+			if (ImGuiMCP::Toggle(strings::TR("AAOS_DisableDeadKeys", "Disable dead keys"), &deadKeys)) { keyboard::disableDeadKeys = deadKeys; }
+			HelpMarker(strings::TR("AAOS_HelpDisableDeadKeys", "For keyboard layouts with accent keys, such as US-International: quotes and accents type at once in the console instead of waiting for the next key. Applies the next time the game starts."));
 		}
 
 		void RenderDebugSection()
@@ -267,7 +353,11 @@ namespace UI
 		ImGuiMCP::PushItemWidth(320.0F);
 		RenderStatusSection();
 		ImGuiMCP::Spacing();
+		RenderVolumeSection();
+		ImGuiMCP::Spacing();
 		RenderDeviceSection();
+		ImGuiMCP::Spacing();
+		RenderKeyboardSection();
 		ImGuiMCP::Spacing();
 		RenderDebugSection();
 		ImGuiMCP::PopItemWidth();

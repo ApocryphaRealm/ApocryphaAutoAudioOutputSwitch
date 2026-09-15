@@ -42,6 +42,8 @@ namespace audioswitch
 	// switch is running. The device list is refreshed at most once a second.
 	Status GetStatus();
 	std::vector<std::string> DeviceNames();
+	// The lower-case Windows endpoint id the game's sound goes to right now; empty when it has no output. Any thread.
+	std::string CurrentDeviceId();
 
 	void Install();                                   // SKSEPluginLoad: pin XAudio2_7.dll and patch the vtable
 	void StartWatcher();                              // SKSEPluginLoad: endpoint notifications + the reset worker

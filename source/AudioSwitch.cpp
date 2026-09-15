@@ -964,7 +964,7 @@ namespace audioswitch
 				logger::error("{}", g_threadHookResult);
 				return false;
 			}
-			SKSE::AllocTrampoline(14);
+			// the trampoline is allocated once in SKSEPluginLoad (main.cpp), shared with the media keys hook
 			auto& trampoline = SKSE::GetTrampoline();
 			g_origProcessSounds = reinterpret_cast<ProcessSoundsFn>(trampoline.write_call<5>(site, reinterpret_cast<std::uintptr_t>(&HookProcessSounds)));
 			g_threadHookResult = std::format("hooked the audio thread's sound-processing call at +0x{:X}", site - g_addr.threadLoop);
@@ -1129,6 +1129,20 @@ namespace audioswitch
 		std::uint32_t g_requests{ 0 };
 		std::uint32_t g_runs{ 0 };
 
+		// bSwitchToNewDevice (the owner, 2026-09-14: "allow users to connect their headset after the game started"): endpoints
+		// that became active while the game runs, newest last. Render and capture ids alike - Evaluate keeps only the ones in
+		// its active render list. Cleared once a check has acted on one (or the preferred device outranked it).
+		std::mutex g_arrivalLock;
+		std::vector<std::string> g_arrivals;
+
+		void NoteArrival(const std::string& a_id)
+		{
+			std::scoped_lock l(g_arrivalLock);
+			std::erase(g_arrivals, a_id);
+			g_arrivals.push_back(a_id);
+			if (g_arrivals.size() > 8) { g_arrivals.erase(g_arrivals.begin()); }
+		}
+
 		void Evaluate(const std::string& a_reason, bool a_force, const std::string& a_avoidId)
 		{
 			State snap;
@@ -1156,7 +1170,24 @@ namespace audioswitch
 			const Endpoint* preferred = PreferredEndpoint(active);
 			const Endpoint* def = nullptr;
 			for (const auto& e : active) { if (e.isDefault) { def = &e; } }
-			const Endpoint* target = preferred ? preferred : (def ? def : (active.empty() ? nullptr : &active.front()));
+			// A device connected while playing: the newest arrival that is an active output now.
+			const Endpoint* arrived = nullptr;
+			if (settings::general::switchToNewDevice)
+			{
+				std::scoped_lock l(g_arrivalLock);
+				for (auto it = g_arrivals.rbegin(); it != g_arrivals.rend() && !arrived; ++it)
+				{
+					for (const auto& e : active)
+					{
+						if (e.id == *it)
+						{
+							arrived = &e;
+							break;
+						}
+					}
+				}
+			}
+			const Endpoint* target = preferred ? preferred : (arrived ? arrived : (def ? def : (active.empty() ? nullptr : &active.front())));
 			const bool currentActive = std::any_of(active.begin(), active.end(), [&](const Endpoint& e) { return e.id == snap.deviceId; });
 			const bool critical = g_critical.load();
 
@@ -1168,11 +1199,17 @@ namespace audioswitch
 			else if (!snap.master) { swap = true; decision = "the game has no output yet"; }
 			else if (!currentActive) { swap = true; decision = "the current device is gone"; }
 			else if (preferred) { swap = snap.deviceId != preferred->id; decision = swap ? "the preferred device is available" : "already on the preferred device"; }
+			else if (arrived) { swap = snap.deviceId != arrived->id; decision = swap ? "an output device was connected while playing" : "already on the device connected while playing"; }
 			else if (settings::general::switchOnDefaultChange) { swap = snap.deviceId != target->id; decision = swap ? "the Windows default device changed" : "already on the Windows default device"; }
 			else { decision = "the current device is still connected and following the Windows default is off"; }
 
 			logger::info("switch check ({}): on \"{}\", target \"{}\", critical={}: {}", a_reason, snap.deviceName.empty() ? "(none)" : snap.deviceName,
 						 target ? target->name : "(none)", critical, decision);
+			if (arrived || preferred)
+			{
+				std::scoped_lock l(g_arrivalLock);
+				g_arrivals.clear();   // acted on; a later Windows default change still counts
+			}
 			if (!swap)
 			{
 				SetResult(decision);
@@ -1257,12 +1294,14 @@ namespace audioswitch
 					std::scoped_lock l(g_stateLock);
 					leaving = a_state != DEVICE_STATE_ACTIVE && !g_state.deviceId.empty() && g_state.deviceId == id;
 				}
+				if (a_state == DEVICE_STATE_ACTIVE) { NoteArrival(id); }
 				RequestReset(std::format("endpoint {} is now {}", id, EndpointStateName(a_state)), false, leaving, leaving ? id : std::string());
 				return S_OK;
 			}
 
 			HRESULT STDMETHODCALLTYPE OnDeviceAdded(LPCWSTR a_id) override
 			{
+				NoteArrival(Lower(Narrow(a_id)));
 				RequestReset(std::format("endpoint {} added", Lower(Narrow(a_id))), false);
 				return S_OK;
 			}
@@ -1452,6 +1491,12 @@ namespace audioswitch
 		s.resets = g_state.switches;
 		s.lastResult = g_state.lastResult;
 		return s;
+	}
+
+	std::string CurrentDeviceId()
+	{
+		std::scoped_lock l(g_stateLock);
+		return g_state.master ? g_state.deviceId : std::string();
 	}
 
 	std::vector<std::string> DeviceNames()

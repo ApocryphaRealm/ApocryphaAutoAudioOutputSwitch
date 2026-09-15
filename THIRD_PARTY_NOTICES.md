@@ -68,3 +68,13 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
+## Media Keys Fix SKSE
+
+Copyright (c) 2023-2026 Emerson Pinter (epinter). https://github.com/epinter/MediaKeysFix - Nexus Mods 92948.
+Licensed under the GNU Lesser General Public License, version 3 or later (LGPL-3.0-or-later).
+
+The media keys feature (`include/KeyboardAccess.h`, `source/KeyboardAccess.cpp`) re-implements Media Keys Fix's
+approach: the SetCooperativeLevel flags patch in the game's DirectInput keyboard setup (Address Library 67471 / 68781,
+offset 0x55, instruction `41 B8 15 00 00 00 48 8B D0 FF`) and the ToUnicode wrap that disables dead keys (67472 +0x20D /
+68782 +0x2CB, `FF 15 ?? ?? ?? ?? 83 F8 01 75`). The LGPL-3.0 permits using that work in this GPL-3.0-or-later program;
+the GPL-3.0 text shipped with this mod covers it. Thank you to Emerson Pinter for finding and publishing the fix.

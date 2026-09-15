@@ -95,15 +95,21 @@ namespace settings
 			get("uloglevel:debug", [](const std::string& v) { return ParseUInt(v, debug::logLevel); });
 			get("benabled:general", [](const std::string& v) { bool b; if (!ParseBool(v, b)) { return false; } general::enabled = b; return true; });
 			get("bswitchondefaultchange:general", [](const std::string& v) { bool b; if (!ParseBool(v, b)) { return false; } general::switchOnDefaultChange = b; return true; });
+			get("bswitchtonewdevice:general", [](const std::string& v) { bool b; if (!ParseBool(v, b)) { return false; } general::switchToNewDevice = b; return true; });
 			get("uresetdelayms:general", [](const std::string& v) {
 				std::uint32_t u;
 				if (!ParseUInt(v, u)) { return false; }
 				general::resetDelayMs = std::clamp<std::uint32_t>(u, 0u, 10000u);
 				return true;
 			});
+			get("bmediakeys:keyboard", [](const std::string& v) { bool b; if (!ParseBool(v, b)) { return false; } keyboard::mediaKeys = b; return true; });
+			get("bdisablewindowskey:keyboard", [](const std::string& v) { bool b; if (!ParseBool(v, b)) { return false; } keyboard::disableWindowsKey = b; return true; });
+			get("bdisabledeadkeys:keyboard", [](const std::string& v) { bool b; if (!ParseBool(v, b)) { return false; } keyboard::disableDeadKeys = b; return true; });
 			get("spreferreddevice:general", [](const std::string& v) { std::string s; ParseString(v, s); SetPreferredDevice(s); return true; });
-			logger::info("settings loaded from {}: enabled={} preferredDevice=\"{}\" switchOnDefaultChange={} resetDelayMs={} logLevel={}", iniPath,
-						 general::enabled.load(), GetPreferredDevice(), general::switchOnDefaultChange.load(), general::resetDelayMs.load(), debug::logLevel);
+			logger::info("settings loaded from {}: enabled={} preferredDevice=\"{}\" switchOnDefaultChange={} switchToNewDevice={} resetDelayMs={} logLevel={}", iniPath,
+						 general::enabled.load(), GetPreferredDevice(), general::switchOnDefaultChange.load(), general::switchToNewDevice.load(), general::resetDelayMs.load(), debug::logLevel);
+			logger::info("keyboard settings: mediaKeys={} disableWindowsKey={} disableDeadKeys={}", keyboard::mediaKeys.load(), keyboard::disableWindowsKey.load(),
+						 keyboard::disableDeadKeys.load());
 			return true;
 		}
 
@@ -124,8 +130,32 @@ namespace settings
 					return true;
 				}
 			}
-			logger::warn("Save: key {} not found in [{}]", a_key, a_section);
-			return false;
+			// A key an older INI does not have yet (a setting added in a later version) goes at the end of its section.
+			std::string current;
+			std::size_t insertAt = std::string::npos;
+			for (std::size_t i = 0; i < a_lines.size(); ++i)
+			{
+				const std::string t = Trim(a_lines[i]);
+				if (IsSectionHeader(t))
+				{
+					current = Lower(t.substr(1, t.size() - 2));
+					if (current == wantSection) { insertAt = i + 1; }
+					continue;
+				}
+				if (current == wantSection && !t.empty()) { insertAt = i + 1; }
+			}
+			if (insertAt == std::string::npos)
+			{
+				// A whole section an older INI does not have yet goes at the end of the file.
+				if (!a_lines.empty() && !Trim(a_lines.back()).empty()) { a_lines.emplace_back(); }
+				a_lines.push_back(std::string("[") + a_section + "]");
+				a_lines.push_back(std::string(a_key) + "=" + a_value);
+				logger::info("Save: [{}] {} added", a_section, a_key);
+				return true;
+			}
+			a_lines.insert(a_lines.begin() + static_cast<std::ptrdiff_t>(insertAt), std::string(a_key) + "=" + a_value);
+			logger::info("Save: {} added to [{}]", a_key, a_section);
+			return true;
 		}
 	}
 
@@ -151,7 +181,11 @@ namespace settings
 			utils::MakeSetting("bEnabled:General", general::enabled.load()),
 			utils::MakeSetting("sPreferredDevice:General", ""),
 			utils::MakeSetting("bSwitchOnDefaultChange:General", general::switchOnDefaultChange.load()),
-			utils::MakeSetting("uResetDelayMs:General", static_cast<unsigned int>(general::resetDelayMs.load())));
+			utils::MakeSetting("bSwitchToNewDevice:General", general::switchToNewDevice.load()),
+			utils::MakeSetting("uResetDelayMs:General", static_cast<unsigned int>(general::resetDelayMs.load())),
+			utils::MakeSetting("bMediaKeys:Keyboard", keyboard::mediaKeys.load()),
+			utils::MakeSetting("bDisableWindowsKey:Keyboard", keyboard::disableWindowsKey.load()),
+			utils::MakeSetting("bDisableDeadKeys:Keyboard", keyboard::disableDeadKeys.load()));
 
 		LoadFileValues();
 	}
@@ -179,7 +213,11 @@ namespace settings
 		ok &= WriteKey(lines, "General", "bEnabled", general::enabled ? "1" : "0");
 		ok &= WriteKey(lines, "General", "sPreferredDevice", GetPreferredDevice());
 		ok &= WriteKey(lines, "General", "bSwitchOnDefaultChange", general::switchOnDefaultChange ? "1" : "0");
+		ok &= WriteKey(lines, "General", "bSwitchToNewDevice", general::switchToNewDevice ? "1" : "0");
 		ok &= WriteKey(lines, "General", "uResetDelayMs", std::to_string(general::resetDelayMs.load()));
+		ok &= WriteKey(lines, "Keyboard", "bMediaKeys", keyboard::mediaKeys ? "1" : "0");
+		ok &= WriteKey(lines, "Keyboard", "bDisableWindowsKey", keyboard::disableWindowsKey ? "1" : "0");
+		ok &= WriteKey(lines, "Keyboard", "bDisableDeadKeys", keyboard::disableDeadKeys ? "1" : "0");
 
 		std::ofstream out(iniPath, std::ios::trunc);
 		if (!out) { logger::error("Save: could not open {} for writing", iniPath); return false; }
@@ -194,7 +232,11 @@ namespace settings
 		debug::logLevel = 0;
 		general::enabled = true;
 		general::switchOnDefaultChange = true;
+		general::switchToNewDevice = true;
 		general::resetDelayMs = 500;
+		keyboard::mediaKeys = true;
+		keyboard::disableWindowsKey = true;
+		keyboard::disableDeadKeys = false;
 		SetPreferredDevice("");
 		ApplyLogLevel();
 	}

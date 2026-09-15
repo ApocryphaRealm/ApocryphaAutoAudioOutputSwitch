@@ -6,8 +6,10 @@
 
 #include "AudioSwitch.h"
 #include "DevBenchTool.h"
+#include "KeyboardAccess.h"
 #include "Settings.h"
 #include "UI.h"
+#include "Volume.h"
 
 #include "utils/Logger.h"
 #include "utils/Strings.h"
@@ -46,8 +48,13 @@ SKSEPluginLoad(const SKSE::LoadInterface* a_skse)
 
 	logger::info("Auto Audio Output Switch {} loading", SKSE::PluginDeclaration::GetSingleton()->GetVersion().string("."));
 
+	// One trampoline for both call hooks: the audio thread's sound processing (5-byte call) and, when dead keys are
+	// disabled, the keyboard's ToUnicode call (6-byte call) - 14 bytes each.
+	SKSE::AllocTrampoline(28);
+	mediakeys::Install();   // before the game creates its DirectInput keyboard
 	audioswitch::Install();
 	audioswitch::StartWatcher();
+	volume::Start();
 
 	SKSE::GetMessagingInterface()->RegisterListener(MessageHandler);
 
