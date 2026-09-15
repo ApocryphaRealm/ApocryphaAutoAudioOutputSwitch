@@ -48,12 +48,14 @@ namespace audioswitch
 		constexpr std::uintptr_t kVoiceListCount = 0x88;   // global voice list: count; data inline at +8 when flags < 0
 		constexpr int kSlotInit = 1;                       // BSXAudio2Audio vtable
 		constexpr int kSlotShutdown = 2;
+		constexpr std::uintptr_t kAudioEngineOff = 0x50;   // BSXAudio2Audio: IXAudio2* (the game's shutdown nulls it)
 
 		struct GameAddresses
 		{
 			std::uintptr_t threadLoop{ 0 };     // BSAudioManagerThread run loop
 			std::uintptr_t processSounds{ 0 };  // the per-pass sound processing it calls
 			std::uintptr_t setupSound{ 0 };     // create + set up one sound's source voice (rcx = sound) -> bool
+			std::uintptr_t buildVoice{ 0 };     // builds the source voice through the engine; called once, from setupSound
 			std::uintptr_t voiceListA{ 0 };
 			std::uintptr_t voiceListB{ 0 };
 			std::uintptr_t audioObject{ 0 };    // global BSXAudio2Audio*
@@ -377,6 +379,10 @@ namespace audioswitch
 		std::atomic<std::uint32_t> g_deviceCountCalls{ 0 };
 		std::string g_installResult{ "not run" };
 		std::string g_threadHookResult{ "not run" };
+		std::string g_voiceGuardResult{ "not run" };
+		std::atomic<std::uint32_t> g_nullEngineSkips{ 0 };
+		std::atomic<std::int64_t> g_lastNullEngineResetMs{ 0 };
+		std::atomic<bool> g_failNextInit{ false };  // DevBench op=failinit: reproduce a rebuild that leaves no engine
 
 		// swap handoff: the worker decides and waits; the audio thread performs
 		std::mutex g_swapLock;
@@ -702,7 +708,12 @@ namespace audioswitch
 
 		HRESULT STDMETHODCALLTYPE HookInitialize(IXAudio2* a_this, UINT32 a_flags, UINT32 a_processor)
 		{
-			const HRESULT hr = g_origInitialize(a_this, a_flags, a_processor);
+			HRESULT hr = g_origInitialize(a_this, a_flags, a_processor);
+			if (t_inside == 0 && SUCCEEDED(hr) && g_failNextInit.exchange(false))
+			{
+				hr = static_cast<HRESULT>(0x88960004);  // XAUDIO2_E_DEVICE_INVALID: the game releases the engine and leaves +0x50 null
+				logger::warn("DevBench tool: this engine initialisation is failed on purpose, so the game is left with no audio engine");
+			}
 			if (t_inside == 0)
 			{
 				const auto n = g_initializeCalls.fetch_add(1) + 1;
@@ -862,7 +873,10 @@ namespace audioswitch
 			// 3. the game's own shutdown and init; init creates the mastering voice through our hook on the target
 			SehInfo seh{};
 			g_swapStep = 3;
-			CallGameSlot(audio, kSlotShutdown, &seh);
+			// The game's shutdown calls into its engine without a null check; after a rebuild that could not create one
+			// there is nothing to shut down.
+			if (ReadPtr(audio, kAudioEngineOff)) { CallGameSlot(audio, kSlotShutdown, &seh); }
+			else { logger::info("the game has no audio engine (an earlier rebuild could not create one); its shutdown is skipped"); }
 			{
 				std::scoped_lock l(g_stateLock);
 				g_state.engine = nullptr;
@@ -883,6 +897,12 @@ namespace audioswitch
 			{
 				RemoveSounds(mgr, false);
 				FailSwap(std::format("switch failed: the game's audio init faulted (0x{:08X}); sounds were dropped", seh.code));
+				return;
+			}
+			if (!ReadPtr(audio, kAudioEngineOff))
+			{
+				const int dropped = RemoveSounds(mgr, false);
+				FailSwap(std::format("the game's audio init could not create an audio engine (was \"{}\"); {} sound(s) dropped; new sounds are skipped until a switch succeeds", from, dropped));
 				return;
 			}
 			if (!ReadPtr(audio, kAudioMasterOff))
@@ -943,6 +963,58 @@ namespace audioswitch
 			VirtualProtect(entry, sizeof(void*), old, &old);
 			logger::info("hooked {} (vtable slot {}, original {})", a_name, a_slot, Ptr(*a_original));
 			return true;
+		}
+
+		// ---- the game never builds a sound's voice on a missing engine ----
+		// The game builds each new sound's source voice (SE 66708 / AE 67955) through BSXAudio2Audio+0x50 with no null check,
+		// and its shutdown nulls that field while sound stays switched on (+0x40). When a rebuild's init cannot create an
+		// engine (IXAudio2::Initialize failing while a device changes), the next sound crashed there - a Nexus report on AE
+		// 1.6.1170, 67955+0x231 (falsification episode 47). Its one call, in the per-sound setup, gets no voice instead, which
+		// the game already handles by dropping that sound, and a switch is requested at most every 5 s so audio comes back
+		// once a device takes it.
+		using BuildVoiceFn = void* (*)(void*, void*, void*, void*, std::uint8_t);
+		BuildVoiceFn g_origBuildVoice = nullptr;
+
+		void* HookBuildVoice(void* a_audio, void* a_desc, void* a_owner, void* a_extra, std::uint8_t a_flag)
+		{
+			if (a_audio && !ReadPtr(a_audio, kAudioEngineOff))
+			{
+				const auto n = g_nullEngineSkips.fetch_add(1) + 1;
+				if (n == 1 || n % 500 == 0)
+				{
+					logger::warn("the game started a sound while it has no audio engine; the sound was skipped instead of crashing ({} so far)", n);
+				}
+				const std::int64_t now = NowMs();
+				std::int64_t last = g_lastNullEngineResetMs.load();
+				if (now - last >= 5000 && g_lastNullEngineResetMs.compare_exchange_strong(last, now))
+				{
+					RequestReset("the game has no audio engine", true, true);
+				}
+				return nullptr;
+			}
+			return g_origBuildVoice(a_audio, a_desc, a_owner, a_extra, a_flag);
+		}
+
+		void InstallVoiceGuard()
+		{
+			const auto* setup = reinterpret_cast<const std::uint8_t*>(g_addr.setupSound);
+			std::uintptr_t site = 0;
+			for (std::uintptr_t off = 0; off < 0x1A0 && !site; ++off)
+			{
+				if (setup[off] != 0xE8) { continue; }
+				std::int32_t rel = 0;
+				std::memcpy(&rel, setup + off + 1, sizeof(rel));
+				if (g_addr.setupSound + off + 5 + static_cast<std::intptr_t>(rel) == g_addr.buildVoice) { site = g_addr.setupSound + off; }
+			}
+			if (!site)
+			{
+				g_voiceGuardResult = "the call that builds a sound's voice was not found in the per-sound setup; sounds are not guarded against a missing engine";
+				logger::warn("{}", g_voiceGuardResult);
+				return;
+			}
+			g_origBuildVoice = reinterpret_cast<BuildVoiceFn>(SKSE::GetTrampoline().write_call<5>(site, reinterpret_cast<std::uintptr_t>(&HookBuildVoice)));
+			g_voiceGuardResult = std::format("guarded the per-sound setup's voice call at +0x{:X}", site - g_addr.setupSound);
+			logger::info("{}", g_voiceGuardResult);
 		}
 
 		bool InstallThreadHook()
@@ -1392,8 +1464,10 @@ namespace audioswitch
 		g_addr.voiceListB = REL::RelocationID(511867, 388393).address();
 		g_addr.audioObject = REL::RelocationID(523613, 410149).address();
 		g_addr.audioVtable = REL::RelocationID(285056, 236527).address();
+		g_addr.buildVoice = REL::RelocationID(66708, 67955).address();
 		logger::info("game addresses: thread loop {:X}, sound processing {:X}, sound setup {:X}, voice lists {:X}/{:X}, audio object {:X}, audio vtable {:X}",
 					 g_addr.threadLoop, g_addr.processSounds, g_addr.setupSound, g_addr.voiceListA, g_addr.voiceListB, g_addr.audioObject, g_addr.audioVtable);
+		InstallVoiceGuard();
 
 		HMODULE module = LoadLibraryW(L"XAudio2_7.dll");
 		if (!module)
@@ -1515,6 +1589,12 @@ namespace audioswitch
 		return cached;
 	}
 
+	void FailNextEngineInit()
+	{
+		g_failNextInit = true;
+		logger::info("DevBench tool: the next engine initialisation will fail on purpose");
+	}
+
 	std::string StateJson()
 	{
 		State snap;
@@ -1524,12 +1604,12 @@ namespace audioswitch
 		}
 		std::scoped_lock l(g_wakeLock);
 		return std::format(
-			"\"hooks\":{{\"installed\":{},\"result\":\"{}\",\"audioThread\":{},\"audioThreadResult\":\"{}\",\"initializeCalls\":{},\"deviceCountCalls\":{}}},"
+			"\"hooks\":{{\"installed\":{},\"result\":\"{}\",\"audioThread\":{},\"audioThreadResult\":\"{}\",\"initializeCalls\":{},\"deviceCountCalls\":{},\"voiceGuard\":\"{}\",\"soundsSkippedNoEngine\":{}}},"
 			"\"worker\":{{\"result\":\"{}\",\"pending\":{},\"busy\":{},\"swapPending\":{},\"requests\":{},\"runs\":{},\"lastReason\":\"{}\"}},"
 			"\"engines\":[{{\"audioObject\":\"{}\",\"engine\":\"{}\",\"master\":\"{}\",\"attached\":{},\"device\":\"{}\",\"deviceId\":\"{}\",\"channels\":{},\"rate\":{},"
 			"\"passes\":{},\"critical\":{},\"criticalErrors\":{},\"resets\":{},\"failures\":{},\"lastResult\":\"{}\"}}]",
 			g_hooked.load() ? "true" : "false", EscapeJson(g_installResult), g_threadHooked.load() ? "true" : "false", EscapeJson(g_threadHookResult),
-			g_initializeCalls.load(), g_deviceCountCalls.load(), EscapeJson(g_watcherResult), g_pending ? "true" : "false", g_busy ? "true" : "false",
+			g_initializeCalls.load(), g_deviceCountCalls.load(), EscapeJson(g_voiceGuardResult), g_nullEngineSkips.load(), EscapeJson(g_watcherResult), g_pending ? "true" : "false", g_busy ? "true" : "false",
 			g_swapPending.load() ? "true" : "false", g_requests, g_runs, EscapeJson(g_lastReason), Ptr(snap.audio), Ptr(snap.engine), Ptr(snap.master),
 			snap.master ? "true" : "false", EscapeJson(snap.deviceName), EscapeJson(snap.deviceId), snap.channels, snap.rate, g_passes.load(),
 			g_critical.load() ? "true" : "false", g_criticalCount.load(), snap.switches, snap.failures, EscapeJson(snap.lastResult));

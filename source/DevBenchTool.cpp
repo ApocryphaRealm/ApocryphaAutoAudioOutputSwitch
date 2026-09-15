@@ -97,6 +97,14 @@ namespace DevBenchTool
 				a_write(a_sink, StateReply(op == "reset" ? "reset" : "check", idle, idle ? "" : ",\"error\":\"the worker did not finish within 10 s\"").c_str());
 				return;
 			}
+			if (op == "failinit")
+			{
+				audioswitch::FailNextEngineInit();
+				audioswitch::RequestReset("DevBench tool: rebuild with the engine initialisation failed on purpose", true);
+				const bool idle = audioswitch::WaitIdle(10000);
+				a_write(a_sink, StateReply("failinit", idle, idle ? "" : ",\"error\":\"the worker did not finish within 10 s\"").c_str());
+				return;
+			}
 			if (op == "prefer")
 			{
 				bool present = false;
@@ -196,7 +204,7 @@ namespace DevBenchTool
 			"XAudio2 engine (device, attached, processing passes, critical errors, resets, last result). op=devices: the XAudio2 device list "
 			"and the Windows render endpoints with state and default. op=check runs a reset check now (switches only if needed); op=reset "
 			"forces a switch to the target device. op=prefer name=\\\"...\\\" sets the preferred device (part of a name, a full id, or empty) "
-			"and checks. op=set with enabled / switchOnDefaultChange / switchToNewDevice / resetDelayMs, or mediaKeys / disableWindowsKey / disableDeadKeys (saved; the keyboard ones apply at the next game start - state reports mediaKeys status). op=volume [level=0-100] [mute=true|false]: read or set the Windows volume and mute of the device the game plays on. op=reload re-reads the INI and checks.\","
+			"and checks. op=set with enabled / switchOnDefaultChange / switchToNewDevice / resetDelayMs, or mediaKeys / disableWindowsKey / disableDeadKeys (saved; the keyboard ones apply at the next game start - state reports mediaKeys status). op=volume [level=0-100] [mute=true|false]: read or set the Windows volume and mute of the device the game plays on. op=reload re-reads the INI and checks. op=failinit (test): forces a switch whose engine initialisation fails on purpose, leaving the game with no audio engine - state hooks.soundsSkippedNoEngine counts sounds skipped instead of crashing, and a switch is retried every 5 s.\","
 			"\"inputSchema\":{\"type\":\"object\",\"properties\":{\"op\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"},"
 			"\"enabled\":{\"type\":\"boolean\"},\"switchOnDefaultChange\":{\"type\":\"boolean\"},\"switchToNewDevice\":{\"type\":\"boolean\"},\"mediaKeys\":{\"type\":\"boolean\"},\"disableWindowsKey\":{\"type\":\"boolean\"},\"disableDeadKeys\":{\"type\":\"boolean\"},\"level\":{\"type\":\"number\"},\"mute\":{\"type\":\"boolean\"},\"resetDelayMs\":{\"type\":\"integer\"}}},"
 			"\"readOnly\":false"

@@ -51,6 +51,9 @@ namespace audioswitch
 	// a_avoidId is a device to leave out of the choice (the one that is going away).
 	void RequestReset(std::string_view a_reason, bool a_force, bool a_urgent = false, std::string_view a_avoidId = {});
 	bool WaitIdle(int a_timeoutMs);                   // for the DevBench tool: true once no reset is pending or running
+	// For the DevBench tool: the next engine initialisation fails on purpose, leaving the game with no audio engine (a
+	// rebuild on a device that cannot take audio yet) - sounds must be skipped, not crash, and a later switch recovers.
+	void FailNextEngineInit();
 	std::string StateJson();                          // engines, hooks, counters
 	std::string DevicesJson();                        // XAudio2 device list (from a live engine) and Windows endpoints
 	void LogSummary(std::string_view a_when);

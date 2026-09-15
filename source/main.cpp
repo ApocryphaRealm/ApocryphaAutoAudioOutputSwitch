@@ -50,7 +50,7 @@ SKSEPluginLoad(const SKSE::LoadInterface* a_skse)
 
 	// One trampoline for both call hooks: the audio thread's sound processing (5-byte call) and, when dead keys are
 	// disabled, the keyboard's ToUnicode call (6-byte call) - 14 bytes each.
-	SKSE::AllocTrampoline(28);
+	SKSE::AllocTrampoline(42);  // media keys ToUnicode wrap + the audio voice guard (14 bytes each), with room
 	mediakeys::Install();   // before the game creates its DirectInput keyboard
 	audioswitch::Install();
 	audioswitch::StartWatcher();
