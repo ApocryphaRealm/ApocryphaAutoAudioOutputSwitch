@@ -409,6 +409,8 @@ namespace audioswitch
 		VoiceVtableHook g_voiceVtables[6]{};
 		std::mutex g_voiceVtableLock;
 		InitializeFn g_origInitialize{ nullptr };
+		StartEngineFn g_origStartEngine{ nullptr };
+		StopEngineFn g_origStopEngine{ nullptr };
 		GetDeviceCountFn g_origDeviceCount{ nullptr };
 		using ProcessSoundsFn = void (*)(void*);
 		ProcessSoundsFn g_origProcessSounds{ nullptr };
@@ -430,6 +432,13 @@ namespace audioswitch
 		// live COM object, so such a call returns an error instead of crashing. Audio thread only (the switch runs there).
 		std::vector<IUnknown*> g_heldEngines;
 		std::vector<IUnknown*> g_pinnedEngines;  // held for good: a mod's hook was repaired, so its cached pointer never moves on
+		// Taken by the switch from the engine-creation check to the end of the game's init, and by an engine call forwarded from
+		// another thread, so a forwarded StopEngine/StartEngine never lands on an engine that is being torn down or built.
+		std::recursive_mutex g_pinLock;
+		// What another mod last asked of the engine from outside the audio thread: -1 nothing, 0 stopped, 1 started. Better
+		// AltTab stops the engine when the game loses focus and starts it when it comes back; a switch in between would
+		// otherwise leave the new engine playing while the game is in the background.
+		std::atomic<int> g_otherModEngineState{ -1 };
 		std::atomic<bool> g_inRebuild{ false };
 		std::atomic<std::uint32_t> g_heldCount{ 0 };
 
@@ -638,6 +647,7 @@ namespace audioswitch
 
 		void PinEngine(IUnknown* a_engine)
 		{
+			std::scoped_lock l(g_pinLock);
 			if (!a_engine) { return; }
 			for (IUnknown* e : g_pinnedEngines) { if (e == a_engine) { return; } }
 			g_pinnedEngines.push_back(a_engine);
@@ -986,6 +996,85 @@ namespace audioswitch
 			return hr;
 		}
 
+		// ---- StartEngine / StopEngine from other mods ----
+		// Called on an engine AAOS keeps alive for another mod (pinned: that mod's hook was repaired, so its cached pointer
+		// never moves on), the call is passed to the engine that is playing, so the mod keeps working - Better AltTab's
+		// "stop the audio in the background" goes on muting the game after a switch. The game's own calls come from the audio
+		// thread (its shutdown stops the old engine) and pass straight through.
+		bool IsPinnedEngine(IXAudio2* a_engine)
+		{
+			std::scoped_lock l(g_pinLock);
+			for (IUnknown* e : g_pinnedEngines) { if (static_cast<void*>(e) == static_cast<void*>(a_engine)) { return true; } }
+			return false;
+		}
+
+		IXAudio2* PlayingEngineOtherThan(IXAudio2* a_engine)
+		{
+			if (g_inRebuild.load()) { return nullptr; }
+			std::scoped_lock l(g_stateLock);
+			return (g_state.engine && g_state.engine != a_engine) ? g_state.engine : nullptr;
+		}
+
+		void LogForwarded(bool a_start, IXAudio2* a_from, IXAudio2* a_to)
+		{
+			static std::atomic<int> last{ -1 };
+			const int now = a_start ? 1 : 0;
+			if (last.exchange(now) != now)
+			{
+				logger::info("another mod called {} on kept engine {}; passed to the playing engine {}", a_start ? "StartEngine" : "StopEngine", Ptr(a_from), Ptr(a_to));
+			}
+		}
+
+		bool FromOtherThread() { return t_inside == 0 && GetCurrentThreadId() != g_audioTid.load(); }
+
+		HRESULT STDMETHODCALLTYPE HookStartEngine(IXAudio2* a_this)
+		{
+			if (FromOtherThread())
+			{
+				g_otherModEngineState = 1;
+				if (IsPinnedEngine(a_this))
+				{
+					std::scoped_lock l(g_pinLock);
+					if (IXAudio2* live = PlayingEngineOtherThan(a_this))
+					{
+						LogForwarded(true, a_this, live);
+						return g_origStartEngine(live);
+					}
+					return S_OK;
+				}
+			}
+			return g_origStartEngine(a_this);
+		}
+
+		void STDMETHODCALLTYPE HookStopEngine(IXAudio2* a_this)
+		{
+			if (FromOtherThread())
+			{
+				g_otherModEngineState = 0;
+				if (IsPinnedEngine(a_this))
+				{
+					std::scoped_lock l(g_pinLock);
+					if (IXAudio2* live = PlayingEngineOtherThan(a_this))
+					{
+						LogForwarded(false, a_this, live);
+						g_origStopEngine(live);
+					}
+					return;
+				}
+			}
+			g_origStopEngine(a_this);
+		}
+
+		const char* OtherModEngineText()
+		{
+			switch (g_otherModEngineState.load())
+			{
+			case 0: return "stopped";
+			case 1: return "started";
+			default: return "none";
+			}
+		}
+
 		HRESULT STDMETHODCALLTYPE HookGetDeviceCount(IXAudio2* a_this, UINT32* a_count)
 		{
 			const HRESULT hr = g_origDeviceCount(a_this, a_count);
@@ -1139,6 +1228,7 @@ namespace audioswitch
 			g_swapStep = 3;
 			// The game's shutdown calls into its engine without a null check; after a rebuild that could not create one
 			// there is nothing to shut down.
+			std::unique_lock pinGuard(g_pinLock);
 			const bool repaired = CheckEngineCreateCall();
 			g_inRebuild = true;
 			if (void* oldEngine = ReadPtr(audio, kAudioEngineOff))
@@ -1171,6 +1261,7 @@ namespace audioswitch
 			g_swapStep = 4;
 			const int initResult = CallGameSlot(audio, kSlotInit, &seh);
 			g_inRebuild = false;
+			pinGuard.unlock();
 			if (seh.code)
 			{
 				RemoveSounds(mgr, false);
@@ -1192,6 +1283,14 @@ namespace audioswitch
 			}
 
 			ReleaseHeldEngines(static_cast<IUnknown*>(ReadPtr(audio, kAudioEngineOff)));
+			if (g_otherModEngineState.load() == 0 && g_origStopEngine)
+			{
+				if (auto* rebuilt = static_cast<IXAudio2*>(ReadPtr(audio, kAudioEngineOff)))
+				{
+					g_origStopEngine(rebuilt);
+					logger::info("the rebuilt engine is stopped as well: another mod had stopped the game's sound (the game is in the background)");
+				}
+			}
 			g_swapStep = 5;
 			// 4. the game's own per-sound voice setup rebuilds every surviving sound on the new engine
 			int revived = 0;
@@ -1830,6 +1929,11 @@ namespace audioswitch
 		ok &= PatchSlot(vtable, slot::kGetDeviceCount, reinterpret_cast<void*>(&HookGetDeviceCount), reinterpret_cast<void**>(&g_origDeviceCount), "IXAudio2::GetDeviceCount");
 		ok &= PatchSlot(vtable, slot::kCreateSourceVoice, reinterpret_cast<void*>(&HookCreateSource), reinterpret_cast<void**>(&g_origCreateSource), "IXAudio2::CreateSourceVoice");
 		ok &= PatchSlot(vtable, slot::kCreateSubmixVoice, reinterpret_cast<void*>(&HookCreateSubmix), reinterpret_cast<void**>(&g_origCreateSubmix), "IXAudio2::CreateSubmixVoice");
+		if (!PatchSlot(vtable, slot::kStartEngine, reinterpret_cast<void*>(&HookStartEngine), reinterpret_cast<void**>(&g_origStartEngine), "IXAudio2::StartEngine") ||
+			!PatchSlot(vtable, slot::kStopEngine, reinterpret_cast<void*>(&HookStopEngine), reinterpret_cast<void**>(&g_origStopEngine), "IXAudio2::StopEngine"))
+		{
+			logger::warn("StartEngine/StopEngine could not be hooked; another mod's engine calls are not forwarded after a switch");
+		}
 		g_hooked = ok && g_origMaster && g_origInitialize && g_origDeviceCount && g_origCreateSource && g_origCreateSubmix;
 		g_threadHooked = g_hooked && InstallThreadHook();
 		g_installResult = g_hooked ? std::format("hooked (XAudio2_7.dll at {}, vtable {})", Ptr(module), Ptr(vtable)) : std::string("one or more vtable slots could not be hooked");
@@ -1922,12 +2026,12 @@ namespace audioswitch
 		}
 		std::scoped_lock l(g_wakeLock);
 		return std::format(
-			"\"hooks\":{{\"installed\":{},\"result\":\"{}\",\"audioThread\":{},\"audioThreadResult\":\"{}\",\"initializeCalls\":{},\"deviceCountCalls\":{},\"voiceGuard\":\"{}\",\"soundsSkippedNoEngine\":{},\"heldEngines\":{},\"pinnedEngines\":{},\"createCall\":\"{}\"}},"
+			"\"hooks\":{{\"installed\":{},\"result\":\"{}\",\"audioThread\":{},\"audioThreadResult\":\"{}\",\"initializeCalls\":{},\"deviceCountCalls\":{},\"voiceGuard\":\"{}\",\"soundsSkippedNoEngine\":{},\"heldEngines\":{},\"pinnedEngines\":{},\"createCall\":\"{}\",\"otherModEngine\":\"{}\"}},"
 			"\"worker\":{{\"result\":\"{}\",\"pending\":{},\"busy\":{},\"swapPending\":{},\"requests\":{},\"runs\":{},\"lastReason\":\"{}\"}},"
 			"\"engines\":[{{\"audioObject\":\"{}\",\"engine\":\"{}\",\"master\":\"{}\",\"attached\":{},\"device\":\"{}\",\"deviceId\":\"{}\",\"channels\":{},\"rate\":{},"
 			"\"passes\":{},\"critical\":{},\"criticalErrors\":{},\"resets\":{},\"failures\":{},\"lastResult\":\"{}\"}}]",
 			g_hooked.load() ? "true" : "false", EscapeJson(g_installResult), g_threadHooked.load() ? "true" : "false", EscapeJson(g_threadHookResult),
-			g_initializeCalls.load(), g_deviceCountCalls.load(), EscapeJson(g_voiceGuardResult), g_nullEngineSkips.load(), g_heldCount.load(), g_pinnedEngines.size(), EscapeJson(g_createCallState), EscapeJson(g_watcherResult), g_pending ? "true" : "false", g_busy ? "true" : "false",
+			g_initializeCalls.load(), g_deviceCountCalls.load(), EscapeJson(g_voiceGuardResult), g_nullEngineSkips.load(), g_heldCount.load(), g_pinnedEngines.size(), EscapeJson(g_createCallState), OtherModEngineText(), EscapeJson(g_watcherResult), g_pending ? "true" : "false", g_busy ? "true" : "false",
 			g_swapPending.load() ? "true" : "false", g_requests, g_runs, EscapeJson(g_lastReason), Ptr(snap.audio), Ptr(snap.engine), Ptr(snap.master),
 			snap.master ? "true" : "false", EscapeJson(snap.deviceName), EscapeJson(snap.deviceId), snap.channels, snap.rate, g_passes.load(),
 			g_critical.load() ? "true" : "false", g_criticalCount.load(), snap.switches, snap.failures, EscapeJson(snap.lastResult));

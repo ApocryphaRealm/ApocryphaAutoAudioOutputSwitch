@@ -100,6 +100,8 @@ namespace xa27
 		inline constexpr std::size_t kCreateSourceVoice = 8;
 		inline constexpr std::size_t kCreateSubmixVoice = 9;
 		inline constexpr std::size_t kCreateMasteringVoice = 10;
+		inline constexpr std::size_t kStartEngine = 11;
+		inline constexpr std::size_t kStopEngine = 12;
 		inline constexpr std::size_t kDestroyVoice = 18;
 	}
 
@@ -109,5 +111,7 @@ namespace xa27
 	using CreateSourceFn = HRESULT(STDMETHODCALLTYPE*)(IXAudio2*, IXAudio2Voice**, const WAVEFORMATEX*, UINT32, float, void*, const VoiceSends*, void*);
 	using CreateSubmixFn = HRESULT(STDMETHODCALLTYPE*)(IXAudio2*, IXAudio2Voice**, UINT32, UINT32, UINT32, UINT32, const VoiceSends*, void*);
 	using CreateMasteringFn = HRESULT(STDMETHODCALLTYPE*)(IXAudio2*, IXAudio2Voice**, UINT32, UINT32, UINT32, UINT32, void*);
+	using StartEngineFn = HRESULT(STDMETHODCALLTYPE*)(IXAudio2*);
+	using StopEngineFn = void(STDMETHODCALLTYPE*)(IXAudio2*);
 	using DestroyVoiceFn = void(STDMETHODCALLTYPE*)(IXAudio2Voice*);
 }
