@@ -1288,6 +1288,31 @@ namespace audioswitch
 				return;
 			}
 
+			// The device the engine plays on went away and XAudio2 has not reported it yet: its own device-removal handling is
+			// still running, and DestroyVoice on that engine meanwhile deadlocks the game's audio thread against XAudio2's
+			// threads for good (falsification episode 46, three real wired-headset unplugs on SE 1.5.97: the one whose critical
+			// error arrived before the switch took 40 ms; the two whose switch started first hung in DestroyVoice with no
+			// critical error ever arriving). So the switch waits for the engine's report first. The extra 100 ms after it is a
+			// margin, not a measured need.
+			if (!currentActive && snap.master && !g_critical.load())
+			{
+				const auto waitStart = std::chrono::steady_clock::now();
+				while (!g_critical.load() && std::chrono::steady_clock::now() - waitStart < std::chrono::milliseconds(3000))
+				{
+					std::this_thread::sleep_for(std::chrono::milliseconds(5));
+				}
+				const auto waited = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - waitStart).count();
+				if (g_critical.load())
+				{
+					std::this_thread::sleep_for(std::chrono::milliseconds(100));
+					logger::info("waited {} ms for the audio engine to finish handling the removed device, then 100 ms more", waited);
+				}
+				else
+				{
+					logger::warn("the audio engine did not report the removed device within {} ms; switching anyway", waited);
+				}
+			}
+
 			bool ready = false;
 			for (int attempt = 0; attempt < 10 && !ready; ++attempt)
 			{
