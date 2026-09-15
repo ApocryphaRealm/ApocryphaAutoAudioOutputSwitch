@@ -1,6 +1,6 @@
 # Changelog
 
-## 1.0.2 - 2026-09-14 - untested
+## 1.0.2 - 2026-09-15 - working
 
 ### Fixed
 - The game could stop responding when the output device was unplugged or switched off. This is a deadlock inside XAudio2 2.7 itself (the June 2010 build Skyrim installs), found from a memory dump with Microsoft's public symbols: when a device disappears, the audio session's disconnect callback and XAudio2's own processing thread can both report the error at once; the first holds XAudio2's lock while waiting for the processing thread to stop, and the processing thread waits for that lock. The hangs this changelog earlier blamed on releasing the old engine's sounds during a switch were this same race - the 3-second wait added in 1.0.1 only made it less likely. The processing thread no longer waits for a lock held by a thread that is waiting for it; XAudio2 then finishes handling the lost device normally and the switch goes ahead. The patch is applied only to that exact XAudio2 build and is checked before it is made (falsification episode 51).
