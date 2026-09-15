@@ -1,6 +1,6 @@
 # Changelog
 
-## 1.0.1 - 2026-09-14 - untested
+## 1.0.1 - 2026-09-14 - working
 
 ### Added
 - Media keys work in game, built in from Media Keys Fix SKSE (the owner: 'i want to incorporate the media keys fix if possible'). Skyrim creates its keyboard with exclusive access, so Windows never sees the volume, mute and other media keys while the game has focus, and a Bluetooth keyboard's Fn media keys bypass even low-level keyboard hooks then (falsification 43-45). New [Keyboard] settings, on the settings page too: bMediaKeys (on) makes the game's keyboard non-exclusive by changing the flags it passes to SetCooperativeLevel (0x15 -> 0x16, checked against the expected instruction first), bDisableWindowsKey (on) keeps the Windows key from opening the Start menu, bDisableDeadKeys (off) wraps the game's ToUnicode call so accent keys type at once in the console. Applied at plugin load, so a change takes effect at the next start. When MediaKeysFix.dll itself is installed this mod leaves the keyboard alone. The approach, addresses and instruction pattern come from Media Keys Fix SKSE by Emerson Pinter (Nexus 92948, LGPL-3.0-or-later), re-implemented and credited in THIRD_PARTY_NOTICES.md. A low-level key hook tried in this version's test builds was removed. One trampoline is now allocated at load for both call hooks.
