@@ -56,6 +56,7 @@ namespace audioswitch
 			std::uintptr_t processSounds{ 0 };  // the per-pass sound processing it calls
 			std::uintptr_t setupSound{ 0 };     // create + set up one sound's source voice (rcx = sound) -> bool
 			std::uintptr_t buildVoice{ 0 };     // builds the source voice through the engine; called once, from setupSound
+			std::uintptr_t createCall{ 0 };     // the game's `call [rip+disp]` to CoCreateInstance(CLSID_XAudio2) in engine creation
 			std::uintptr_t voiceListA{ 0 };
 			std::uintptr_t voiceListB{ 0 };
 			std::uintptr_t audioObject{ 0 };    // global BSXAudio2Audio*
@@ -139,17 +140,55 @@ namespace audioswitch
 		{
 			DWORD code{ 0 };
 			void* at{ nullptr };
+			ULONG_PTR accessKind{ 0 };    // 0 read, 1 write, 8 execute (access violations)
+			ULONG_PTR accessTarget{ 0 };
+			DWORD64 frames[24]{};
+			int frameCount{ 0 };
 		};
 
+		// Runs as the exception FILTER, while the faulting frames are still on the stack (after the handler runs they are
+		// unwound and overwritten). No allocation, no logging: the fault may have happened with a lock held.
 		int FillSeh(EXCEPTION_POINTERS* a_ep, SehInfo* a_out)
 		{
 			if (a_ep && a_ep->ExceptionRecord)
 			{
 				a_out->code = a_ep->ExceptionRecord->ExceptionCode;
 				a_out->at = a_ep->ExceptionRecord->ExceptionAddress;
+				if (a_ep->ExceptionRecord->NumberParameters >= 2)
+				{
+					a_out->accessKind = a_ep->ExceptionRecord->ExceptionInformation[0];
+					a_out->accessTarget = a_ep->ExceptionRecord->ExceptionInformation[1];
+				}
+			}
+			if (a_ep && a_ep->ContextRecord)
+			{
+				CONTEXT ctx = *a_ep->ContextRecord;
+				__try
+				{
+					for (int i = 0; i < 24 && ctx.Rip; ++i)
+					{
+						a_out->frames[a_out->frameCount++] = ctx.Rip;
+						DWORD64 imageBase = 0;
+						PRUNTIME_FUNCTION fn = RtlLookupFunctionEntry(ctx.Rip, &imageBase, nullptr);
+						if (!fn)
+						{
+							ctx.Rip = *reinterpret_cast<DWORD64*>(ctx.Rsp);
+							ctx.Rsp += 8;
+							continue;
+						}
+						PVOID handlerData = nullptr;
+						DWORD64 establisher = 0;
+						RtlVirtualUnwind(UNW_FLAG_NHANDLER, imageBase, ctx.Rip, fn, &ctx, &handlerData, &establisher, nullptr);
+					}
+				}
+				__except (EXCEPTION_EXECUTE_HANDLER) {}
 			}
 			return EXCEPTION_EXECUTE_HANDLER;
 		}
+
+		// defined further down, used by the switch
+		std::string FrameText(DWORD64 a_pc);
+		void LogFault(const char* a_where, const SehInfo& a_seh);
 
 		void* ReadPtr(void* a_base, std::uintptr_t a_off)
 		{
@@ -383,6 +422,227 @@ namespace audioswitch
 		std::atomic<std::uint32_t> g_nullEngineSkips{ 0 };
 		std::atomic<std::int64_t> g_lastNullEngineResetMs{ 0 };
 		std::atomic<bool> g_failNextInit{ false };  // DevBench op=failinit: reproduce a rebuild that leaves no engine
+
+		// Engines a rebuild makes the game release, kept alive by our own reference until a rebuild succeeds. Another mod
+		// may have cached the engine pointer - Better AltTab stores the IXAudio2* from the game's CoCreateInstance call and
+		// calls StopEngine/StartEngine on it at every focus change (Nexus report, falsification episode 49: a rebuild whose
+		// init did not produce a new engine left it calling through freed memory). A held engine is stopped and dead but a
+		// live COM object, so such a call returns an error instead of crashing. Audio thread only (the switch runs there).
+		std::vector<IUnknown*> g_heldEngines;
+		std::vector<IUnknown*> g_pinnedEngines;  // held for good: a mod's hook was repaired, so its cached pointer never moves on
+		std::atomic<bool> g_inRebuild{ false };
+		std::atomic<std::uint32_t> g_heldCount{ 0 };
+
+		bool AddRefSafe(IUnknown* a_engine)
+		{
+			__try
+			{
+				a_engine->AddRef();
+				return true;
+			}
+			__except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+		}
+
+		void ReleaseSafe(IUnknown* a_engine)
+		{
+			__try { a_engine->Release(); }
+			__except (EXCEPTION_EXECUTE_HANDLER) {}
+		}
+
+		void HoldEngine(IUnknown* a_engine, const char* a_why)
+		{
+			if (!a_engine) { return; }
+			for (IUnknown* e : g_heldEngines) { if (e == a_engine) { return; } }
+			for (IUnknown* e : g_pinnedEngines) { if (e == a_engine) { return; } }
+			if (!AddRefSafe(a_engine)) { return; }
+			g_heldEngines.push_back(a_engine);
+			g_heldCount = static_cast<std::uint32_t>(g_heldEngines.size());
+			logger::info("holding engine {} ({}) so a pointer another mod cached stays valid; {} held", static_cast<void*>(a_engine), a_why, g_heldEngines.size());
+		}
+
+		void ReleaseHeldEngines(IUnknown* a_keep)
+		{
+			int released = 0;
+			for (IUnknown* e : g_heldEngines)
+			{
+				bool pinned = false;
+				for (IUnknown* q : g_pinnedEngines) { if (q == e) { pinned = true; } }
+				if (e == a_keep || pinned) { continue; }
+				ReleaseSafe(e);
+				++released;
+			}
+			g_heldEngines.clear();
+			g_heldCount = static_cast<std::uint32_t>(g_pinnedEngines.size());
+			if (released) { logger::info("released {} held engine(s) after the rebuild succeeded", released); }
+		}
+
+		// ---- the game's engine-creation call, checked before every rebuild ----
+		// Better AltTab (Nexus 121342) write_call<6>-hooks this exact call (SE 66746+0x44, AE/1.7 67952+0xB7) to cache the new
+		// engine, and its hook's branch slot lives in a trampoline block that is gone by the time the game has loaded its data
+		// (its log shows a fresh "Default Trampoline => 0B / 64B" then). The first engine creation works; every later one - every
+		// AAOS rebuild - jumps through unmapped memory (1.0.2 fault log: SkyrimSE.exe+BFCBB4 reading 0x7FF6C17D0000; falsification
+		// episode 50). Before a rebuild the call is decoded; if it goes through memory that is not there any more it is pointed
+		// back at the game's own CoCreateInstance import. The mod whose hook is dropped keeps the engine it cached, which is then
+		// pinned (kept referenced for good) so its StopEngine/StartEngine calls stay harmless.
+		std::string g_createCallState{ "not checked" };
+
+		std::uintptr_t FindImportSlot(const char* a_dll, const char* a_func)
+		{
+			const std::uintptr_t base = REL::Module::get().base();
+			__try
+			{
+				auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
+				auto* nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
+				const IMAGE_DATA_DIRECTORY& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+				if (!dir.VirtualAddress) { return 0; }
+				for (auto* d = reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR*>(base + dir.VirtualAddress); d->Name; ++d)
+				{
+					if (_stricmp(reinterpret_cast<const char*>(base + d->Name), a_dll) != 0 || !d->OriginalFirstThunk) { continue; }
+					auto* names = reinterpret_cast<IMAGE_THUNK_DATA64*>(base + d->OriginalFirstThunk);
+					auto* iat = reinterpret_cast<IMAGE_THUNK_DATA64*>(base + d->FirstThunk);
+					for (; names->u1.AddressOfData; ++names, ++iat)
+					{
+						if (IMAGE_SNAP_BY_ORDINAL64(names->u1.Ordinal)) { continue; }
+						auto* byName = reinterpret_cast<IMAGE_IMPORT_BY_NAME*>(base + names->u1.AddressOfData);
+						if (std::strcmp(reinterpret_cast<const char*>(byName->Name), a_func) == 0) { return reinterpret_cast<std::uintptr_t>(iat); }
+					}
+				}
+			}
+			__except (EXCEPTION_EXECUTE_HANDLER) {}
+			return 0;
+		}
+
+		// MEM_COMMIT, not PAGE_NOACCESS/PAGE_GUARD, and executable when asked; the whole range inside one region.
+		bool MemoryUsable(std::uintptr_t a_addr, std::size_t a_len, bool a_exec, DWORD* a_state, DWORD* a_protect)
+		{
+			MEMORY_BASIC_INFORMATION mbi{};
+			*a_state = 0;
+			*a_protect = 0;
+			if (!VirtualQuery(reinterpret_cast<LPCVOID>(a_addr), &mbi, sizeof(mbi))) { return false; }
+			*a_state = mbi.State;
+			*a_protect = mbi.Protect;
+			if (mbi.State != MEM_COMMIT || (mbi.Protect & PAGE_GUARD) || (mbi.Protect & 0xFF) == PAGE_NOACCESS) { return false; }
+			if (a_exec)
+			{
+				const DWORD p = mbi.Protect & 0xFF;
+				if (p != PAGE_EXECUTE && p != PAGE_EXECUTE_READ && p != PAGE_EXECUTE_READWRITE && p != PAGE_EXECUTE_WRITECOPY) { return false; }
+			}
+			return a_addr + a_len <= reinterpret_cast<std::uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
+		}
+
+		// form: 6 = FF 15 disp32, 5 = E8 rel32, 0 = something else; -1 when reading faulted. POD only (SEH).
+		int DecodeCall(std::uintptr_t a_site, std::uintptr_t* a_slot, std::uintptr_t* a_target)
+		{
+			*a_slot = 0;
+			*a_target = 0;
+			__try
+			{
+				const auto* p = reinterpret_cast<const std::uint8_t*>(a_site);
+				std::int32_t rel = 0;
+				if (p[0] == 0xFF && p[1] == 0x15)
+				{
+					std::memcpy(&rel, p + 2, sizeof(rel));
+					*a_slot = a_site + 6 + static_cast<std::intptr_t>(rel);
+					return 6;
+				}
+				if (p[0] == 0xE8)
+				{
+					std::memcpy(&rel, p + 1, sizeof(rel));
+					*a_target = a_site + 5 + static_cast<std::intptr_t>(rel);
+					return 5;
+				}
+				return 0;
+			}
+			__except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+		}
+
+		std::uintptr_t ReadSlot(std::uintptr_t a_slot)
+		{
+			__try { return *reinterpret_cast<std::uintptr_t*>(a_slot); }
+			__except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+		}
+
+		// Returns true when the call was repaired in this check.
+		bool CheckEngineCreateCall()
+		{
+			const std::uintptr_t site = g_addr.createCall;
+			if (!site) { return false; }
+			static std::uintptr_t iat = 0;
+			if (!iat) { iat = FindImportSlot("ole32.dll", "CoCreateInstance"); }
+
+			std::uintptr_t slot = 0;
+			std::uintptr_t target = 0;
+			const int form = DecodeCall(site, &slot, &target);
+			DWORD state = 0;
+			DWORD protect = 0;
+			std::string broken;
+			if (form == 6)
+			{
+				if (iat && slot == iat)
+				{
+					g_createCallState = "the game's own CoCreateInstance import";
+					return false;
+				}
+				if (!MemoryUsable(slot, sizeof(std::uintptr_t), false, &state, &protect))
+				{
+					broken = std::format("its branch slot {:X} is not usable memory (state 0x{:X}, protect 0x{:X})", slot, state, protect);
+				}
+				else
+				{
+					target = ReadSlot(slot);
+					if (!MemoryUsable(target, 1, true, &state, &protect))
+					{
+						broken = std::format("its target {:X} (through slot {:X}) is not executable memory (state 0x{:X}, protect 0x{:X})", target, slot, state, protect);
+					}
+				}
+			}
+			else if (form == 5)
+			{
+				if (!MemoryUsable(target, 1, true, &state, &protect))
+				{
+					broken = std::format("its target {:X} is not executable memory (state 0x{:X}, protect 0x{:X})", target, state, protect);
+				}
+			}
+			else
+			{
+				g_createCallState = form < 0 ? "unreadable" : "unexpected instruction";
+				return false;
+			}
+
+			if (broken.empty())
+			{
+				const std::string now = std::format("hooked by another mod, working ({})", FrameText(form == 6 ? ReadSlot(slot) : target));
+				if (now != g_createCallState) { logger::info("the game's engine-creation call is {}", now); }
+				g_createCallState = now;
+				return false;
+			}
+			if (!iat)
+			{
+				g_createCallState = "broken, not repairable (the game's CoCreateInstance import was not found)";
+				logger::error("the game's engine-creation call at {} is broken - {} - and the game's CoCreateInstance import was not found to repair it", FrameText(site), broken);
+				return false;
+			}
+			const std::intptr_t disp = static_cast<std::intptr_t>(iat) - static_cast<std::intptr_t>(site + 6);
+			if (disp < INT32_MIN || disp > INT32_MAX) { return false; }
+			std::uint8_t bytes[6]{ 0xFF, 0x15, 0, 0, 0, 0 };
+			const auto disp32 = static_cast<std::int32_t>(disp);
+			std::memcpy(bytes + 2, &disp32, sizeof(disp32));
+			REL::safe_write(site, bytes, sizeof(bytes));
+			g_createCallState = "repaired (another mod's hook had been left pointing at freed memory)";
+			logger::warn("the game's engine-creation call at {} went through memory that no longer exists - {}. Another mod's hook left it dangling "
+						 "(Better AltTab's XAudio2 hook does this once the game's data has loaded). It now calls the game's own CoCreateInstance import again, "
+						 "so the audio engine can be rebuilt; that mod's hook no longer runs there.",
+				FrameText(site), broken);
+			return true;
+		}
+
+		void PinEngine(IUnknown* a_engine)
+		{
+			if (!a_engine) { return; }
+			for (IUnknown* e : g_pinnedEngines) { if (e == a_engine) { return; } }
+			g_pinnedEngines.push_back(a_engine);
+			logger::info("keeping engine {} referenced for good: the mod whose hook was repaired still holds its pointer", static_cast<void*>(a_engine));
+		}
 
 		// swap handoff: the worker decides and waits; the audio thread performs
 		std::mutex g_swapLock;
@@ -714,6 +974,10 @@ namespace audioswitch
 				hr = static_cast<HRESULT>(0x88960004);  // XAUDIO2_E_DEVICE_INVALID: the game releases the engine and leaves +0x50 null
 				logger::warn("DevBench tool: this engine initialisation is failed on purpose, so the game is left with no audio engine");
 			}
+			if (t_inside == 0 && FAILED(hr) && g_inRebuild.load())
+			{
+				HoldEngine(a_this, "its Initialize failed inside a rebuild");
+			}
 			if (t_inside == 0)
 			{
 				const auto n = g_initializeCalls.fetch_add(1) + 1;
@@ -875,7 +1139,18 @@ namespace audioswitch
 			g_swapStep = 3;
 			// The game's shutdown calls into its engine without a null check; after a rebuild that could not create one
 			// there is nothing to shut down.
-			if (ReadPtr(audio, kAudioEngineOff)) { CallGameSlot(audio, kSlotShutdown, &seh); }
+			const bool repaired = CheckEngineCreateCall();
+			g_inRebuild = true;
+			if (void* oldEngine = ReadPtr(audio, kAudioEngineOff))
+			{
+				HoldEngine(static_cast<IUnknown*>(oldEngine), "the game's shutdown releases it");
+				if (repaired) { PinEngine(static_cast<IUnknown*>(oldEngine)); }
+				CallGameSlot(audio, kSlotShutdown, &seh);
+			}
+			else if (repaired)
+			{
+				for (IUnknown* e : std::vector<IUnknown*>(g_heldEngines)) { PinEngine(e); }
+			}
 			else { logger::info("the game has no audio engine (an earlier rebuild could not create one); its shutdown is skipped"); }
 			{
 				std::scoped_lock l(g_stateLock);
@@ -885,7 +1160,9 @@ namespace audioswitch
 			if (seh.code)
 			{
 				RemoveSounds(mgr, false);
-				FailSwap(std::format("switch failed: the game's audio shutdown faulted (0x{:08X}); sounds were dropped", seh.code));
+				g_inRebuild = false;
+				LogFault("shutdown", seh);
+				FailSwap(std::format("switch failed: the game's audio shutdown faulted (0x{:08X} at {}); sounds were dropped", seh.code, FrameText(reinterpret_cast<DWORD64>(seh.at))));
 				return;
 			}
 			std::uint32_t poolWas = 0;
@@ -893,10 +1170,12 @@ namespace audioswitch
 			g_dropLogged = false;
 			g_swapStep = 4;
 			const int initResult = CallGameSlot(audio, kSlotInit, &seh);
+			g_inRebuild = false;
 			if (seh.code)
 			{
 				RemoveSounds(mgr, false);
-				FailSwap(std::format("switch failed: the game's audio init faulted (0x{:08X}); sounds were dropped", seh.code));
+				LogFault("init", seh);
+				FailSwap(std::format("switch failed: the game's audio init faulted (0x{:08X} at {}); sounds were dropped", seh.code, FrameText(reinterpret_cast<DWORD64>(seh.at))));
 				return;
 			}
 			if (!ReadPtr(audio, kAudioEngineOff))
@@ -912,6 +1191,7 @@ namespace audioswitch
 				return;
 			}
 
+			ReleaseHeldEngines(static_cast<IUnknown*>(ReadPtr(audio, kAudioEngineOff)));
 			g_swapStep = 5;
 			// 4. the game's own per-sound voice setup rebuilds every surviving sound on the new engine
 			int revived = 0;
@@ -1141,6 +1421,16 @@ namespace audioswitch
 			}
 			if (a_inAudio) { *a_inAudio = audio; }
 			return out;
+		}
+
+		void LogFault(const char* a_where, const SehInfo& a_seh)
+		{
+			StackFrames frames{};
+			frames.count = a_seh.frameCount;
+			for (int i = 0; i < a_seh.frameCount && i < 24; ++i) { frames.pc[i] = a_seh.frames[i]; }
+			const char* kind = a_seh.accessKind == 1 ? "writing" : (a_seh.accessKind == 8 ? "executing" : "reading");
+			logger::error("the game's audio {} faulted: 0x{:08X} at {} {} 0x{:X}; stack: {}", a_where, a_seh.code, FrameText(reinterpret_cast<DWORD64>(a_seh.at)), kind,
+						  a_seh.accessTarget, StackText(frames));
 		}
 
 		void ReportAudioThread(std::string_view a_why)
@@ -1490,9 +1780,12 @@ namespace audioswitch
 		g_addr.audioObject = REL::RelocationID(523613, 410149).address();
 		g_addr.audioVtable = REL::RelocationID(285056, 236527).address();
 		g_addr.buildVoice = REL::RelocationID(66708, 67955).address();
+		g_addr.createCall = REL::RelocationID(66746, 67952).address() + REL::Relocate(0x44, 0xB7);
 		logger::info("game addresses: thread loop {:X}, sound processing {:X}, sound setup {:X}, voice lists {:X}/{:X}, audio object {:X}, audio vtable {:X}",
 					 g_addr.threadLoop, g_addr.processSounds, g_addr.setupSound, g_addr.voiceListA, g_addr.voiceListB, g_addr.audioObject, g_addr.audioVtable);
 		InstallVoiceGuard();
+		CheckEngineCreateCall();
+		logger::info("the game's engine-creation call at load: {}", g_createCallState);
 
 		HMODULE module = LoadLibraryW(L"XAudio2_7.dll");
 		if (!module)
@@ -1629,12 +1922,12 @@ namespace audioswitch
 		}
 		std::scoped_lock l(g_wakeLock);
 		return std::format(
-			"\"hooks\":{{\"installed\":{},\"result\":\"{}\",\"audioThread\":{},\"audioThreadResult\":\"{}\",\"initializeCalls\":{},\"deviceCountCalls\":{},\"voiceGuard\":\"{}\",\"soundsSkippedNoEngine\":{}}},"
+			"\"hooks\":{{\"installed\":{},\"result\":\"{}\",\"audioThread\":{},\"audioThreadResult\":\"{}\",\"initializeCalls\":{},\"deviceCountCalls\":{},\"voiceGuard\":\"{}\",\"soundsSkippedNoEngine\":{},\"heldEngines\":{},\"pinnedEngines\":{},\"createCall\":\"{}\"}},"
 			"\"worker\":{{\"result\":\"{}\",\"pending\":{},\"busy\":{},\"swapPending\":{},\"requests\":{},\"runs\":{},\"lastReason\":\"{}\"}},"
 			"\"engines\":[{{\"audioObject\":\"{}\",\"engine\":\"{}\",\"master\":\"{}\",\"attached\":{},\"device\":\"{}\",\"deviceId\":\"{}\",\"channels\":{},\"rate\":{},"
 			"\"passes\":{},\"critical\":{},\"criticalErrors\":{},\"resets\":{},\"failures\":{},\"lastResult\":\"{}\"}}]",
 			g_hooked.load() ? "true" : "false", EscapeJson(g_installResult), g_threadHooked.load() ? "true" : "false", EscapeJson(g_threadHookResult),
-			g_initializeCalls.load(), g_deviceCountCalls.load(), EscapeJson(g_voiceGuardResult), g_nullEngineSkips.load(), EscapeJson(g_watcherResult), g_pending ? "true" : "false", g_busy ? "true" : "false",
+			g_initializeCalls.load(), g_deviceCountCalls.load(), EscapeJson(g_voiceGuardResult), g_nullEngineSkips.load(), g_heldCount.load(), g_pinnedEngines.size(), EscapeJson(g_createCallState), EscapeJson(g_watcherResult), g_pending ? "true" : "false", g_busy ? "true" : "false",
 			g_swapPending.load() ? "true" : "false", g_requests, g_runs, EscapeJson(g_lastReason), Ptr(snap.audio), Ptr(snap.engine), Ptr(snap.master),
 			snap.master ? "true" : "false", EscapeJson(snap.deviceName), EscapeJson(snap.deviceId), snap.channels, snap.rate, g_passes.load(),
 			g_critical.load() ? "true" : "false", g_criticalCount.load(), snap.switches, snap.failures, EscapeJson(snap.lastResult));

@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.0.2 - 2026-09-14 - untested
+
+### Fixed
+- A crash with Better AltTab (Nexus 121342) installed: after the game's sound switched devices, alt-tabbing crashed the game inside Better AltTab (`BetterAltTab.dll`, `Xaudio::stopEngine`). Better AltTab keeps the audio engine pointer from the moment the game creates the engine and stops or starts it at every focus change; when a rebuild did not produce a new engine, that pointer was left on an engine the game had already released. Reproduced on SE 1.5.97 with the reporter's crash address (falsification episode 49). A rebuild now keeps its own reference on every engine the game releases during it - the engine before the game's shutdown, and any engine whose initialisation fails - so a pointer another mod kept stays a live (stopped) engine, and lets them go once a rebuild succeeds.
+
+- Switching devices failed with Better AltTab installed: the rebuilt engine's init faulted every time (`SkyrimSE.exe+BFCBB4`), because Better AltTab's hook on the game's engine-creation call (SE 66746+0x44, AE/1.7 67952+0xB7) branches through a trampoline block that has been freed once the game's data has loaded (found with the new fault log and VirtualQuery: MEM_FREE; falsification episode 50). Before a rebuild the call is now checked; if it goes through memory that is not there it is pointed back at the game's own CoCreateInstance import, and the engine Better AltTab cached is kept referenced for good. Switching works again with Better AltTab installed (reproduced: rebuild in 15 ms, alt-tab afterwards, no crash); Better AltTab's mute then acts on the engine it saw first.
+
+### Changed
+- When the game's audio shutdown or init faults during a switch, the log names the faulting module and offset, what was being read or written, and the call stack at the fault. With Better AltTab installed the rebuilt engine's init faulted before the engine could be created; this is how that fault is being traced.
+
 ## 1.0.1 - 2026-09-14 - working
 
 ### Added

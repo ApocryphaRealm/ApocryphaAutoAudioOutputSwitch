@@ -1,6 +1,6 @@
 ﻿{
     "name": "apocryphaautoaudiooutputswitch",
-    "version-string": "1.0.1",
+    "version-string": "1.0.2",
     "description": "Auto Audio Output Switch - Skyrim's audio follows your output device: pick a preferred device, and the game switches when devices are plugged in, removed or the Windows default changes, without a restart.",
     "homepage": "https://github.com/ApocryphaRealm/ApocryphaAutoAudioOutputSwitch",
     "license": "GPL-3.0-or-later",
