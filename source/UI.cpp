@@ -280,7 +280,7 @@ namespace UI
 				debug::logLevel = static_cast<std::uint32_t>(level);
 				ApplyLogLevel();
 			}
-			HelpMarker(strings::TR("AAOS_HelpLogLevel", "Applies immediately. The log is at Documents\\My Games\\Skyrim Special Edition\\SKSE\\ApocryphaAutoAudioOutputSwitch.log. Set this to Trace or Debug before reproducing a bug you plan to report."));
+			HelpMarker(strings::TR("AAOS_HelpLogLevel", "Applies immediately. The log is at Documents\\My Games\\Skyrim Special Edition\\SKSE\\AutoAudioOutputSwitch.log. Set this to Trace or Debug before reproducing a bug you plan to report."));
 		}
 
 		void RenderButtons()

@@ -31,4 +31,4 @@ its audio thread and reviving each live sound - is built on Live Audio Output Sw
 https://www.nexusmods.com/skyrimspecialedition/mods/184853, notice in `THIRD_PARTY_NOTICES.md` - ported to three game
 versions.
 
-Source code: https://github.com/ApocryphaRealm/ApocryphaAutoAudioOutputSwitch
+Source code: https://github.com/ApocryphaRealm/AutoAudioOutputSwitch

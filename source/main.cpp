@@ -24,7 +24,7 @@ namespace
 			DevBenchTool::Init(false);
 			break;
 		case SKSE::MessagingInterface::kDataLoaded:
-			strings::Configure("ApocryphaAutoAudioOutputSwitch");
+			strings::Configure("AutoAudioOutputSwitch");
 			UI::Register();
 			DevBenchTool::Init(true);
 			audioswitch::LogSummary("data loaded");
@@ -40,11 +40,11 @@ namespace
 SKSEPluginLoad(const SKSE::LoadInterface* a_skse)
 {
 	SKSE::Init(a_skse);
-	SKSE::log::init("ApocryphaAutoAudioOutputSwitch");
+	SKSE::log::init("AutoAudioOutputSwitch");
 
-	settings::Init("ApocryphaAutoAudioOutputSwitch.ini");
+	settings::Init("AutoAudioOutputSwitch.ini");
 	settings::ApplyLogLevel();
-	SKSE::log::describe_level("ApocryphaAutoAudioOutputSwitch.ini");
+	SKSE::log::describe_level("AutoAudioOutputSwitch.ini");
 
 	logger::info("Auto Audio Output Switch {} loading", SKSE::PluginDeclaration::GetSingleton()->GetVersion().string("."));
 

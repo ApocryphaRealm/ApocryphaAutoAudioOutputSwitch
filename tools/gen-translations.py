@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
-"""gen-translations.py - builds the eleven ApocryphaAutoAudioOutputSwitch_<language>.txt files.
+"""gen-translations.py - builds the eleven AutoAudioOutputSwitch_<language>.txt files.
 
 The key list and the English text are read from source/UI.cpp (strings::TR("KEY", "text") and the log-level
 arrays), so they cannot drift from the code. Strings this page shares word for word with Auto Draw's page reuse Auto
 Draw's shipped translations (the log file name substituted); the strings new to this page are this project's own
 translations, held below. A shared key whose English no longer matches Auto Draw's is an error, not a silent reuse.
 
-Output: dist/Interface/Translations/ApocryphaAutoAudioOutputSwitch_<language>.txt - UTF-16LE with a BOM, one
+Output: dist/Interface/Translations/AutoAudioOutputSwitch_<language>.txt - UTF-16LE with a BOM, one
 "$key<TAB>text" per line, CRLF (the SKSE/SkyUI shape the framework reads).
 """
 import codecs
@@ -17,7 +17,7 @@ import sys
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 AUTODRAW = os.path.join(os.path.dirname(REPO), "AutoDraw", "dist", "Interface", "Translations")
-STEM = "ApocryphaAutoAudioOutputSwitch"
+STEM = "AutoAudioOutputSwitch"
 LANGS = ["english", "japanese", "korean", "chinese", "russian", "german", "french", "spanish", "italian", "polish", "czech"]
 
 TR_RE = re.compile(r'strings::TR\(\s*"((?:[^"\\]|\\.)+)"\s*,\s*"((?:[^"\\]|\\.)*)"\s*\)')

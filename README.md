@@ -15,8 +15,8 @@ unplugged. With this plugin the game moves its sound:
 - on demand, with Switch now on the settings page.
 
 Settings: the Auto Audio Output Switch page in the Apocrypha Menu Framework (or SKSE Menu Framework), or
-`SKSE/Plugins/ApocryphaAutoAudioOutputSwitch.ini`. Log:
-`Documents/My Games/Skyrim Special Edition/SKSE/ApocryphaAutoAudioOutputSwitch.log`.
+`SKSE/Plugins/AutoAudioOutputSwitch.ini`. Log:
+`Documents/My Games/Skyrim Special Edition/SKSE/AutoAudioOutputSwitch.log`.
 
 ## How it works
 
