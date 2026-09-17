@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.0.3 - 2026-09-16 - untested
+
+### Changed
+- **The Apocrypha prefix is gone from the files** (the owner, 2026-09-16: *"Unprefix all of them"*; framework mods keep theirs, this is not one). The DLL is `AutoAudioOutputSwitch.dll`, so the INI is `AutoAudioOutputSwitch.ini`, the log `AutoAudioOutputSwitch.log`, and the translation files `AutoAudioOutputSwitch_<language>.txt`. An old `ApocryphaAutoAudioOutputSwitch.ini` is not read; copy your values across once. No behaviour change; the code is 1.0.2's.
+
 ## 1.0.2 - 2026-09-15 - working
 
 ### Fixed
