@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.0.4 - 2026-09-18 - untested
+
+### Fixed
+- **Updating over 1.0.2 could leave the game silent.** 1.0.3 renamed the DLL, and an update installed on top of the old
+  files rather than replacing them left both `ApocryphaAutoAudioOutputSwitch.dll` and `AutoAudioOutputSwitch.dll` in
+  `SKSE\Plugins`. SKSE loads both, and two copies of this mod hooking the same XAudio2 engine and rebuilding it under
+  each other is silence on the next device switch (Arshia13, Nexus Posts, 2026-09-18: *"Update to 1.0.3 and now game is
+  mute using wireless headphone ... it was fine in 1.0.2"*). This build now checks for the old DLL at load and, when it
+  is there, stands down with a message naming the file to delete instead of running alongside it.
+- **Settings survive the rename.** Values in an old `ApocryphaAutoAudioOutputSwitch.ini` are read first and the current
+  `AutoAudioOutputSwitch.ini`'s values win, so a preferred device or a switched-off option set before 1.0.3 is not lost
+  and nothing changed since is undone. The log says how many values came from the old file.
+
+### Changed
+- The Address Library pre-check runs before anything else at load: a missing Address Library file for the game version
+  gets a message naming the file and the plugin loads inert, instead of CommonLibSSE-NG's bare failure line.
+
 ## 1.0.3 - 2026-09-16 - untested
 
 ### Changed

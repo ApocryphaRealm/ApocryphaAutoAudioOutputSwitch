@@ -33,7 +33,9 @@ namespace settings
 	std::string GetPreferredDevice();
 	void SetPreferredDevice(std::string a_value);
 
-	void Init(const std::string& a_iniFileName);
+	// a_previousIniFileName: the INI name before the 1.0.3 rename; its values are read first, the current file's win.
+	void Init(const std::string& a_iniFileName, const std::string& a_previousIniFileName = {});
+	int MigratedKeys();  // how many keys the previous INI supplied on the last load (0 when it is not there)
 	bool Reload();
 	bool Save();
 	void RestoreDefaults();  // every setting back to its fresh-install value; nothing is written until Save

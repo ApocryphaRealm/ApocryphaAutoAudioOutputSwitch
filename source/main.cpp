@@ -11,6 +11,7 @@
 #include "UI.h"
 #include "Volume.h"
 
+#include "utils/AddressLibraryGuard.h"
 #include "utils/Logger.h"
 #include "utils/Strings.h"
 
@@ -37,12 +38,49 @@ namespace
 	}
 }
 
+namespace
+{
+	// 1.0.3 renamed the DLL (ApocryphaAutoAudioOutputSwitch.dll -> AutoAudioOutputSwitch.dll). An update
+	// installed OVER 1.0.2 rather than replacing it leaves both files in SKSE\\Plugins, and SKSE loads both:
+	// two switchers hooking the same XAudio2 engine and rebuilding it under each other is silence or a
+	// crash (Arshia13 on the Nexus page, 2026-09-18: "Update to 1.0.3 and now game is mute using wireless
+	// headphone ... it was fine in 1.0.2"). SKSE loads plugins in name order, so the old one is already in
+	// the process when this one runs; when it is, this one stands down and says which file to delete.
+	constexpr const wchar_t* kPreviousDll = L"ApocryphaAutoAudioOutputSwitch.dll";
+
+	bool PreviousBuildIsLoaded()
+	{
+		HMODULE old = GetModuleHandleW(kPreviousDll);
+		if (!old) { return false; }
+		const char* text =
+			"Auto Audio Output Switch: the old build (ApocryphaAutoAudioOutputSwitch.dll) is still installed beside "
+			"this one, and running both would leave the game silent.\n\n"
+			"This build has stood down. Delete the old file from Data\\SKSE\\Plugins - "
+			"ApocryphaAutoAudioOutputSwitch.dll, .pdb and .ini (your settings are read from the old .ini "
+			"automatically, so copy nothing) - or reinstall the mod choosing Replace rather than Merge.";
+		logger::critical("[Update] {}", text);
+		MessageBoxA(nullptr, text, "Auto Audio Output Switch", MB_OK | MB_ICONERROR | MB_SETFOREGROUND);
+		return true;
+	}
+}
+
 SKSEPluginLoad(const SKSE::LoadInterface* a_skse)
 {
-	SKSE::Init(a_skse);
 	SKSE::log::init("AutoAudioOutputSwitch");
+	// Address Library pre-check (the guard every mod of ours carries), BEFORE SKSE::Init, which opens the
+	// Address Library itself (logic library 6026): a missing file gets a message naming it, not CommonLib's
+	// bare failure, and the plugin loads inert.
+	if (!AddressLibraryGuard::Guard("Auto Audio Output Switch"))
+	{
+		return true;
+	}
+	if (PreviousBuildIsLoaded())
+	{
+		return true;
+	}
+	SKSE::Init(a_skse);
 
-	settings::Init("AutoAudioOutputSwitch.ini");
+	settings::Init("AutoAudioOutputSwitch.ini", "ApocryphaAutoAudioOutputSwitch.ini");
 	settings::ApplyLogLevel();
 	SKSE::log::describe_level("AutoAudioOutputSwitch.ini");
 

@@ -62,9 +62,15 @@ namespace settings
 
 		bool IsSectionHeader(const std::string& a_t) { return a_t.size() >= 2 && a_t.front() == '[' && a_t.back() == ']'; }
 
-		void ReadFile(std::map<std::string, std::string>& a_keys)
+		// The INI this build reads, and the one 1.0.2 and earlier wrote. A player who updated over the rename
+		// (1.0.3, 2026-09-16) still has their values in the old file; they are read first and the new file's
+		// values win, so nothing a player set is lost across the rename and nothing they set since is undone.
+		std::string oldIniPath;
+		int migratedKeys = 0;
+
+		void ReadFile(const std::string& a_path, std::map<std::string, std::string>& a_keys)
 		{
-			std::ifstream in(iniPath);
+			std::ifstream in(a_path);
 			if (!in) { return; }
 			std::string line, section;
 			while (std::getline(in, line))
@@ -86,7 +92,14 @@ namespace settings
 				return false;
 			}
 			std::map<std::string, std::string> k;
-			ReadFile(k);
+			migratedKeys = 0;
+			if (!oldIniPath.empty() && std::filesystem::exists(oldIniPath))
+			{
+				ReadFile(oldIniPath, k);
+				migratedKeys = static_cast<int>(k.size());
+				logger::info("settings: {} value(s) read from the pre-rename INI {}; the current INI's values take precedence", migratedKeys, oldIniPath);
+			}
+			ReadFile(iniPath, k);
 			auto get = [&](const char* a_key, auto a_apply) {
 				const auto it = k.find(a_key);
 				if (it == k.end()) { logger::debug("INI key {} missing; keeping current value", a_key); return; }
@@ -171,9 +184,11 @@ namespace settings
 		preferredDevice = std::move(a_value);
 	}
 
-	void Init(const std::string& a_iniFileName)
+	void Init(const std::string& a_iniFileName, const std::string& a_previousIniFileName)
 	{
 		iniPath = (std::filesystem::current_path() / "Data" / "SKSE" / "Plugins" / a_iniFileName).string();
+		oldIniPath = a_previousIniFileName.empty() ? std::string() :
+			(std::filesystem::current_path() / "Data" / "SKSE" / "Plugins" / a_previousIniFileName).string();
 
 		auto* collection = utils::INISettingCollection::GetSingleton();
 		collection->AddSettings(
@@ -188,6 +203,11 @@ namespace settings
 			utils::MakeSetting("bDisableDeadKeys:Keyboard", keyboard::disableDeadKeys.load()));
 
 		LoadFileValues();
+	}
+
+	int MigratedKeys()
+	{
+		return migratedKeys;
 	}
 
 	bool Reload()
