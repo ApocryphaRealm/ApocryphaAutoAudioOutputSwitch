@@ -63,10 +63,14 @@ namespace settings
 		bool IsSectionHeader(const std::string& a_t) { return a_t.size() >= 2 && a_t.front() == '[' && a_t.back() == ']'; }
 
 		// The INI this build reads, and the one 1.0.2 and earlier wrote. A player who updated over the rename
-		// (1.0.3, 2026-09-16) still has their values in the old file; they are read first and the new file's
-		// values win, so nothing a player set is lost across the rename and nothing they set since is undone.
+		// (1.0.3, 2026-09-16) still has their values in the old file and a freshly shipped new file beside it,
+		// so the OLD file's values win - they are the player's - and once read they are written into the new
+		// file and the old one is set aside as .migrated, so this happens exactly once and a later edit of the
+		// new file is never undone. (The first cut let the new file win, which kept the shipped defaults and
+		// lost the player's values - the opposite of the point; live test 2026-09-18.)
 		std::string oldIniPath;
 		int migratedKeys = 0;
+		bool migratePending = false;
 
 		void ReadFile(const std::string& a_path, std::map<std::string, std::string>& a_keys)
 		{
@@ -93,13 +97,18 @@ namespace settings
 			}
 			std::map<std::string, std::string> k;
 			migratedKeys = 0;
+			migratePending = false;
+			ReadFile(iniPath, k);
 			if (!oldIniPath.empty() && std::filesystem::exists(oldIniPath))
 			{
-				ReadFile(oldIniPath, k);
-				migratedKeys = static_cast<int>(k.size());
-				logger::info("settings: {} value(s) read from the pre-rename INI {}; the current INI's values take precedence", migratedKeys, oldIniPath);
+				std::map<std::string, std::string> old;
+				ReadFile(oldIniPath, old);
+				for (const auto& [key, value] : old) { k[key] = value; }
+				migratedKeys = static_cast<int>(old.size());
+				migratePending = migratedKeys > 0;
+				logger::info("settings: {} value(s) taken from the pre-rename INI {} - they are the player's and override the shipped file once; they are written to {} and the old file is renamed .migrated",
+							 migratedKeys, oldIniPath, iniPath);
 			}
-			ReadFile(iniPath, k);
 			auto get = [&](const char* a_key, auto a_apply) {
 				const auto it = k.find(a_key);
 				if (it == k.end()) { logger::debug("INI key {} missing; keeping current value", a_key); return; }
@@ -203,6 +212,18 @@ namespace settings
 			utils::MakeSetting("bDisableDeadKeys:Keyboard", keyboard::disableDeadKeys.load()));
 
 		LoadFileValues();
+		if (migratePending)
+		{
+			// Persist the merged values into the current INI, then retire the old file so this runs once.
+			if (Save())
+			{
+				std::error_code ec;
+				std::filesystem::rename(oldIniPath, oldIniPath + ".migrated", ec);
+				if (ec) { logger::warn("settings: could not rename {} to .migrated ({}); its values will be read again next launch", oldIniPath, ec.message()); }
+				else { logger::info("settings: {} renamed to .migrated", oldIniPath); }
+			}
+			migratePending = false;
+		}
 	}
 
 	int MigratedKeys()

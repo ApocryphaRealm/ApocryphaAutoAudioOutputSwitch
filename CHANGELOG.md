@@ -9,9 +9,10 @@
   each other is silence on the next device switch (Arshia13, Nexus Posts, 2026-09-18: *"Update to 1.0.3 and now game is
   mute using wireless headphone ... it was fine in 1.0.2"*). This build now checks for the old DLL at load and, when it
   is there, stands down with a message naming the file to delete instead of running alongside it.
-- **Settings survive the rename.** Values in an old `ApocryphaAutoAudioOutputSwitch.ini` are read first and the current
-  `AutoAudioOutputSwitch.ini`'s values win, so a preferred device or a switched-off option set before 1.0.3 is not lost
-  and nothing changed since is undone. The log says how many values came from the old file.
+- **Settings survive the rename.** Values in an old `ApocryphaAutoAudioOutputSwitch.ini` - the player's - are taken over
+  the freshly shipped `AutoAudioOutputSwitch.ini` once, written into it, and the old file is renamed `.migrated`, so a
+  preferred device or a switched-off option set before 1.0.3 is not lost and a later edit of the new file is never
+  undone. The log says how many values came across.
 
 ### Changed
 - The Address Library pre-check runs before anything else at load: a missing Address Library file for the game version
