@@ -14,6 +14,7 @@
 #include "utils/Logger.h"
 
 #include <Windows.h>
+#include <intrin.h>
 #include <objbase.h>
 #include <mmdeviceapi.h>
 #include <audioclient.h>
@@ -390,6 +391,8 @@ namespace audioswitch
 			~Inside() { --t_inside; }
 		};
 
+		bool FromOtherThread() { return t_inside == 0 && GetCurrentThreadId() != g_audioTid.load(); }
+
 		CreateMasteringFn g_origMaster{ nullptr };
 		CreateSourceFn g_origCreateSource{ nullptr };
 		CreateSubmixFn g_origCreateSubmix{ nullptr };
@@ -430,8 +433,29 @@ namespace audioswitch
 		// calls StopEngine/StartEngine on it at every focus change (Nexus report, falsification episode 49: a rebuild whose
 		// init did not produce a new engine left it calling through freed memory). A held engine is stopped and dead but a
 		// live COM object, so such a call returns an error instead of crashing. Audio thread only (the switch runs there).
-		std::vector<IUnknown*> g_heldEngines;
-		std::vector<IUnknown*> g_pinnedEngines;  // held for good: a mod's hook was repaired, so its cached pointer never moves on
+		// Since 1.0.5 only an engine whose Initialize failed is held this way; the engine the game's shutdown releases is
+		// retired instead (below).
+		struct HeldEngine
+		{
+			IUnknown* engine{ nullptr };
+			const char* why{ "" };
+		};
+		std::vector<HeldEngine> g_heldEngines;
+		std::vector<IUnknown*> g_pinnedEngines;  // retired AND forwarded: a mod's hook was repaired, so its cached pointer never moves on
+
+		// Retired engines (1.0.5): every engine the game's shutdown releases in a switch is kept referenced by AAOS for the
+		// rest of the session and never let go. Dragonborn ReVoiced (Nexus 184221) keeps the game's IXAudio2* and calls
+		// CreateSourceVoice on it from the Papyrus thread; in 1.0.4 ReleaseHeldEngines dropped the last reference once the
+		// rebuild succeeded, and its next voiced line called a destroyed engine (Nexus report by phbd01, 2026-10-03: AE
+		// 1.6.1170, EnterCriticalSection on a deleted lock at XAudio2_7+0x26817 under HookCreateSource). Any mod that keeps the
+		// pointer across a switch hits the same thing. A retired engine is stopped, has no mastering voice and is still a
+		// live COM object; voice creation on it from another thread is refused (RefuseRetired). Cost: one idle engine per
+		// switch. Written only by the audio thread under g_pinLock, append-only, read without a lock (the slot is written
+		// before the count is published), so a thread waiting for g_pinLock can still tell an engine is retired.
+		constexpr std::uint32_t kMaxRetired = 512;
+		std::atomic<IUnknown*> g_retiredEngines[kMaxRetired]{};
+		std::atomic<std::uint32_t> g_retiredCount{ 0 };  // may pass kMaxRetired; only the first kMaxRetired are listed
+		std::atomic<void*> g_stoppedOnAudioThread{ nullptr };  // the last engine StopEngine was called on from the audio thread
 		// Taken by the switch from the engine-creation check to the end of the game's init, and by an engine call forwarded from
 		// another thread, so a forwarded StopEngine/StartEngine never lands on an engine that is being torn down or built.
 		std::recursive_mutex g_pinLock;
@@ -458,31 +482,124 @@ namespace audioswitch
 			__except (EXCEPTION_EXECUTE_HANDLER) {}
 		}
 
+		bool IsRetired(const void* a_engine)
+		{
+			if (!a_engine) { return false; }
+			const std::uint32_t n = (std::min)(g_retiredCount.load(std::memory_order_acquire), kMaxRetired);
+			for (std::uint32_t i = 0; i < n; ++i) { if (g_retiredEngines[i].load(std::memory_order_relaxed) == a_engine) { return true; } }
+			return false;
+		}
+
+		IXAudio2* LiveEngine()
+		{
+			std::scoped_lock l(g_stateLock);
+			return g_state.engine;
+		}
+
+		// ---- which modules call the engine from other threads (1.0.5) ----
+		// Once per engine and caller module, so a log names the mod that kept an engine pointer before anything goes wrong
+		// with it. g_callerLock is a leaf: nothing is called while it is held.
+		struct CallerSeen
+		{
+			const void* engine{ nullptr };
+			HMODULE module{ nullptr };
+		};
+		std::mutex g_callerLock;
+		std::vector<CallerSeen> g_callersSeen;
+		constexpr std::size_t kMaxCallersSeen = 256;
+
+		std::string ModuleName(HMODULE a_module)
+		{
+			if (!a_module) { return "(no module)"; }
+			wchar_t path[MAX_PATH]{};
+			if (!GetModuleFileNameW(a_module, path, MAX_PATH)) { return Ptr(a_module); }
+			const wchar_t* base = path;
+			for (const wchar_t* c = path; *c; ++c) { if (*c == L'\\' || *c == L'/') { base = c + 1; } }
+			return Narrow(base);
+		}
+
+		// The modules seen calling a_engine from another thread, for the retiring line.
+		std::string CallersOf(const void* a_engine)
+		{
+			std::vector<HMODULE> modules;
+			{
+				std::scoped_lock l(g_callerLock);
+				for (const auto& c : g_callersSeen) { if (c.engine == a_engine) { modules.push_back(c.module); } }
+			}
+			std::string out;
+			for (HMODULE m : modules)
+			{
+				if (!out.empty()) { out += ", "; }
+				out += ModuleName(m);
+			}
+			return out.empty() ? std::string("none seen") : out;
+		}
+
+		void NoteOtherThreadCaller(IXAudio2* a_engine, void* a_returnAddress, const char* a_call)
+		{
+			HMODULE module = nullptr;
+			GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, reinterpret_cast<LPCWSTR>(a_returnAddress), &module);
+			{
+				std::scoped_lock l(g_callerLock);
+				for (const auto& c : g_callersSeen) { if (c.engine == a_engine && c.module == module) { return; } }
+				if (g_callersSeen.size() >= kMaxCallersSeen) { return; }
+				g_callersSeen.push_back({ a_engine, module });
+			}
+			const char* which = IsRetired(a_engine) ? "an engine retired at a switch" : (a_engine == LiveEngine() ? "the game's playing engine" : "an engine the game is not using");
+			logger::info("{} called IXAudio2::{} on engine {} ({}) from thread {} - the first such call from {} on that engine",
+				FrameText(reinterpret_cast<DWORD64>(a_returnAddress)), a_call, Ptr(a_engine), which, GetCurrentThreadId(), ModuleName(module));
+		}
+
 		void HoldEngine(IUnknown* a_engine, const char* a_why)
 		{
-			if (!a_engine) { return; }
-			for (IUnknown* e : g_heldEngines) { if (e == a_engine) { return; } }
-			for (IUnknown* e : g_pinnedEngines) { if (e == a_engine) { return; } }
+			if (!a_engine || IsRetired(a_engine)) { return; }
+			for (const HeldEngine& h : g_heldEngines) { if (h.engine == a_engine) { return; } }
 			if (!AddRefSafe(a_engine)) { return; }
-			g_heldEngines.push_back(a_engine);
+			g_heldEngines.push_back({ a_engine, a_why });
 			g_heldCount = static_cast<std::uint32_t>(g_heldEngines.size());
 			logger::info("holding engine {} ({}) so a pointer another mod cached stays valid; {} held", static_cast<void*>(a_engine), a_why, g_heldEngines.size());
 		}
 
+		// Keeps a_engine referenced for good (see g_retiredEngines). The reference HoldEngine took, when there is one,
+		// becomes the retired reference; otherwise one is added. Audio thread.
+		void RetireEngine(IUnknown* a_engine, const char* a_why)
+		{
+			std::scoped_lock l(g_pinLock);
+			if (!a_engine || IsRetired(a_engine)) { return; }
+			const auto held = std::find_if(g_heldEngines.begin(), g_heldEngines.end(), [&](const HeldEngine& h) { return h.engine == a_engine; });
+			if (held != g_heldEngines.end()) { g_heldEngines.erase(held); }
+			else if (!AddRefSafe(a_engine))
+			{
+				logger::warn("engine {} could not be referenced to retire it ({}); a pointer another mod kept to it may outlive it", Ptr(a_engine), a_why);
+				return;
+			}
+			g_heldCount = static_cast<std::uint32_t>(g_heldEngines.size());
+			const std::uint32_t n = g_retiredCount.load(std::memory_order_relaxed);
+			if (n < kMaxRetired) { g_retiredEngines[n].store(a_engine, std::memory_order_relaxed); }
+			else if (n == kMaxRetired)
+			{
+				logger::warn("more than {} engines retired this session; later ones stay referenced, but calls on them are no longer refused", kMaxRetired);
+			}
+			g_retiredCount.store(n + 1, std::memory_order_release);
+			logger::info("retiring engine {} ({}): kept referenced for the rest of the session, so a pointer another mod kept never reaches freed memory; "
+						 "modules seen calling it from other threads: {}; {} engine(s) retired",
+				Ptr(a_engine), a_why, CallersOf(a_engine), n + 1);
+		}
+
+		// Held engines are engines whose Initialize failed inside a rebuild; retired engines are never released.
 		void ReleaseHeldEngines(IUnknown* a_keep)
 		{
 			int released = 0;
-			for (IUnknown* e : g_heldEngines)
+			for (const HeldEngine& h : g_heldEngines)
 			{
-				bool pinned = false;
-				for (IUnknown* q : g_pinnedEngines) { if (q == e) { pinned = true; } }
-				if (e == a_keep || pinned) { continue; }
-				ReleaseSafe(e);
+				if (h.engine == a_keep || IsRetired(h.engine)) { continue; }
+				ReleaseSafe(h.engine);
 				++released;
+				logger::info("released held engine {} ({}) after the rebuild succeeded", Ptr(h.engine), h.why);
 			}
 			g_heldEngines.clear();
-			g_heldCount = static_cast<std::uint32_t>(g_pinnedEngines.size());
-			if (released) { logger::info("released {} held engine(s) after the rebuild succeeded", released); }
+			g_heldCount = 0;
+			if (released) { logger::info("released {} held engine(s) after the rebuild succeeded; {} engine(s) stay retired", released, g_retiredCount.load()); }
 		}
 
 		// ---- the game's engine-creation call, checked before every rebuild ----
@@ -645,10 +762,13 @@ namespace audioswitch
 			return true;
 		}
 
+		// A pinned engine is a retired engine whose StartEngine/StopEngine calls from another thread are passed to the playing
+		// engine (HookStartEngine), because the mod holding it (Better AltTab) never learns of a newer one.
 		void PinEngine(IUnknown* a_engine)
 		{
 			std::scoped_lock l(g_pinLock);
 			if (!a_engine) { return; }
+			RetireEngine(a_engine, "the mod whose hook was repaired still holds its pointer");
 			for (IUnknown* e : g_pinnedEngines) { if (e == a_engine) { return; } }
 			g_pinnedEngines.push_back(a_engine);
 			logger::info("keeping engine {} referenced for good: the mod whose hook was repaired still holds its pointer", static_cast<void*>(a_engine));
@@ -951,9 +1071,91 @@ namespace audioswitch
 			logger::warn("a seventh voice vtable {} was seen; its sends are not filtered", Ptr(vtable));
 		}
 
+		// ---- voice creation from other threads on a retired engine (1.0.5) ----
+		// CreateSourceVoice, CreateSubmixVoice and another mod's CreateMasteringVoice, called from a thread other than the
+		// game's audio thread, take g_pinLock first (as HookStartEngine does) and keep it for the call, so the call never
+		// overlaps a switch tearing the engine down. A call on a retired engine that is not the one playing never reaches
+		// XAudio2: *a_out is nulled and XAUDIO2_E_INVALID_CALL returned, so the mod gets an error it can handle (DBReV should
+		// fall back to its Legacy Playback) instead of a voice on an engine that no longer plays.
+		//
+		// Why this cannot deadlock against PerformSwap (audio thread, g_pinLock held from the engine-creation check to the
+		// end of the game's init):
+		// * Lock order is g_pinLock first, then the leaves g_stateLock, g_voiceVtableLock, g_callerLock, g_swapLock and the
+		//   logger, on every thread. No code takes g_pinLock while holding one of those (g_stateLock is taken inside
+		//   g_pinLock by PerformSwap and PlayingEngineOtherThan, never the other way round; the managed branch of
+		//   HookCreateMastering takes g_stateLock without g_pinLock), so the locks this file owns cannot form a cycle.
+		// * What the switch waits for while it holds g_pinLock is XAudio2: the game's shutdown destroys voices and stops the
+		//   old engine, which waits for that engine's processing pass. A pass can be inside another mod's voice callback,
+		//   and that callback can call one of these hooks. So a thread from outside never blocks on g_pinLock: it polls
+		//   try_lock, gives up as soon as the engine it calls is retired (the switch retires the old engine BEFORE the
+		//   game's shutdown starts, so a callback on the old engine is released before the switch waits for it), and after
+		//   kPinWaitMs passes a call on an engine that is not retired through unserialised - 1.0.4's behaviour, which
+		//   frees nothing now that no engine the game used is ever released. Every new wait is bounded.
+		// * While a thread from outside holds g_pinLock it is only inside XAudio2 creating a voice on an engine that is not
+		//   retired. The game itself creates and destroys voices (DestroyVoice waits for the processing pass) from its audio
+		//   thread on the live engine all the time, so nothing XAudio2 waits for inside such a call can be waiting on the
+		//   audio thread; the switch waiting for that call at g_pinLock therefore always gets the lock. (Better AltTab's
+		//   StopEngine/StartEngine have held g_pinLock across an XAudio2 call from another thread since 1.0.2.)
+		// Not covered: a mod hooking the game's own audio shutdown or init and taking a lock of its own there, while its
+		// other thread holds that lock across an IXAudio2 call. The bound above still frees that thread after kPinWaitMs.
+		constexpr HRESULT kXAudio2InvalidCall = static_cast<HRESULT>(0x88960001);  // XAUDIO2_E_INVALID_CALL
+		constexpr std::int64_t kPinWaitMs = 500;  // a switch holds g_pinLock about 15-70 ms
+		std::atomic<std::uint32_t> g_refusedCalls{ 0 };
+		std::atomic<std::uint32_t> g_unserialisedCalls{ 0 };
+
+		enum class PinWait
+		{
+			kLocked,
+			kRetired,
+			kTimedOut
+		};
+
+		PinWait LockPinForOtherThread(std::unique_lock<std::recursive_mutex>& a_pin, const void* a_engine)
+		{
+			const std::int64_t start = NowMs();
+			for (;;)
+			{
+				if (a_pin.try_lock()) { return PinWait::kLocked; }
+				if (IsRetired(a_engine)) { return PinWait::kRetired; }
+				if (NowMs() - start >= kPinWaitMs) { return PinWait::kTimedOut; }
+				Sleep(1);
+			}
+		}
+
+		// For a call from another thread: records the caller, takes g_pinLock into a_pin, and returns true when the call
+		// must be refused.
+		bool RefuseRetired(std::unique_lock<std::recursive_mutex>& a_pin, IXAudio2* a_engine, void* a_returnAddress, const char* a_call)
+		{
+			NoteOtherThreadCaller(a_engine, a_returnAddress, a_call);
+			if (LockPinForOtherThread(a_pin, a_engine) == PinWait::kTimedOut)
+			{
+				const auto n = g_unserialisedCalls.fetch_add(1) + 1;
+				if (n == 1 || n % 100 == 0)
+				{
+					logger::warn("IXAudio2::{} from {} on engine {} waited {} ms for a device switch to finish and went ahead without it ({} so far)", a_call,
+						FrameText(reinterpret_cast<DWORD64>(a_returnAddress)), Ptr(a_engine), kPinWaitMs, n);
+				}
+			}
+			if (!IsRetired(a_engine) || a_engine == LiveEngine()) { return false; }
+			const auto n = g_refusedCalls.fetch_add(1) + 1;
+			if (n == 1 || n % 100 == 0)
+			{
+				logger::warn("refused IXAudio2::{} from {} on engine {}: the game let that engine go at a device switch and it no longer plays, so the caller "
+							 "gets XAUDIO2_E_INVALID_CALL instead of a voice nobody would hear ({} refused so far)",
+					a_call, FrameText(reinterpret_cast<DWORD64>(a_returnAddress)), Ptr(a_engine), n);
+			}
+			return true;
+		}
+
 		// ---- hooks ----
 		HRESULT STDMETHODCALLTYPE HookCreateSource(IXAudio2* a_this, IXAudio2Voice** a_out, const WAVEFORMATEX* a_format, UINT32 a_flags, float a_maxRatio, void* a_callback, const VoiceSends* a_sends, void* a_chain)
 		{
+			std::unique_lock<std::recursive_mutex> pin(g_pinLock, std::defer_lock);
+			if (FromOtherThread() && RefuseRetired(pin, a_this, _ReturnAddress(), "CreateSourceVoice"))
+			{
+				if (a_out) { *a_out = nullptr; }
+				return kXAudio2InvalidCall;
+			}
 			VoiceSends tmp{};
 			SendDescriptor buf[kMaxSends];
 			UINT32 dropped = 0;
@@ -966,6 +1168,12 @@ namespace audioswitch
 
 		HRESULT STDMETHODCALLTYPE HookCreateSubmix(IXAudio2* a_this, IXAudio2Voice** a_out, UINT32 a_channels, UINT32 a_rate, UINT32 a_flags, UINT32 a_stage, const VoiceSends* a_sends, void* a_chain)
 		{
+			std::unique_lock<std::recursive_mutex> pin(g_pinLock, std::defer_lock);
+			if (FromOtherThread() && RefuseRetired(pin, a_this, _ReturnAddress(), "CreateSubmixVoice"))
+			{
+				if (a_out) { *a_out = nullptr; }
+				return kXAudio2InvalidCall;
+			}
 			VoiceSends tmp{};
 			SendDescriptor buf[kMaxSends];
 			UINT32 dropped = 0;
@@ -1146,8 +1354,6 @@ namespace audioswitch
 			}
 		}
 
-		bool FromOtherThread() { return t_inside == 0 && GetCurrentThreadId() != g_audioTid.load(); }
-
 		HRESULT STDMETHODCALLTYPE HookStartEngine(IXAudio2* a_this)
 		{
 			if (FromOtherThread())
@@ -1183,6 +1389,7 @@ namespace audioswitch
 					return;
 				}
 			}
+			else if (GetCurrentThreadId() == g_audioTid.load()) { g_stoppedOnAudioThread = a_this; }  // the game's shutdown stopping its engine
 			g_origStopEngine(a_this);
 		}
 
@@ -1212,6 +1419,12 @@ namespace audioswitch
 			void* object = a_out ? static_cast<void*>(reinterpret_cast<std::uint8_t*>(a_out) - kAudioMasterOff) : nullptr;
 			if (t_inside > 0 || !IsGameAudioObject(object))
 			{
+				std::unique_lock<std::recursive_mutex> pin(g_pinLock, std::defer_lock);
+				if (FromOtherThread() && RefuseRetired(pin, a_this, _ReturnAddress(), "CreateMasteringVoice"))
+				{
+					if (a_out) { *a_out = nullptr; }
+					return kXAudio2InvalidCall;
+				}
 				return g_origMaster(a_this, a_out, a_channels, a_rate, a_flags, a_index, a_chain);
 			}
 
@@ -1309,6 +1522,42 @@ namespace audioswitch
 			FinishSwap();
 		}
 
+		bool StopEngineSafe(IXAudio2* a_engine)
+		{
+			__try
+			{
+				if (g_origStopEngine) { g_origStopEngine(a_engine); }
+				else { a_engine->StopEngine(); }
+				return true;
+			}
+			__except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+		}
+
+		bool UnregisterCallbackSafe(IXAudio2* a_engine)
+		{
+			__try
+			{
+				a_engine->UnregisterForCallbacks(&g_callback);
+				return true;
+			}
+			__except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+		}
+
+		// After the game's shutdown released a retired engine: it must not play again or report to AAOS. The game's shutdown
+		// normally stops it (its StopEngine passes HookStopEngine on this thread, which notes the engine); if it did not, AAOS
+		// stops it. The device-loss callback AAOS registered on it is removed, so a retired engine never requests a switch -
+		// in 1.0.4 the engine was destroyed here, which removed both.
+		void SettleRetiredEngine(IXAudio2* a_engine)
+		{
+			if (g_stoppedOnAudioThread.load() != a_engine)
+			{
+				const bool stopped = StopEngineSafe(a_engine);
+				logger::info("the game's shutdown did not stop retired engine {}; {}", Ptr(a_engine), stopped ? "AAOS stopped it" : "stopping it faulted and was skipped");
+			}
+			if (!UnregisterCallbackSafe(a_engine)) { logger::warn("removing the device-loss callback from retired engine {} faulted and was skipped", Ptr(a_engine)); }
+			logger::debug("retired engine {} is stopped and no longer reports to this mod", Ptr(a_engine));
+		}
+
 		void PerformSwap()
 		{
 			const auto start = std::chrono::steady_clock::now();
@@ -1354,13 +1603,19 @@ namespace audioswitch
 			g_inRebuild = true;
 			if (void* oldEngine = ReadPtr(audio, kAudioEngineOff))
 			{
-				HoldEngine(static_cast<IUnknown*>(oldEngine), "the game's shutdown releases it");
+				// Retired before the shutdown starts, so a call from another thread already waiting for g_pinLock on this
+				// engine is refused instead of keeping the shutdown waiting (see RefuseRetired).
+				RetireEngine(static_cast<IUnknown*>(oldEngine), "the game's shutdown releases it");
 				if (repaired) { PinEngine(static_cast<IUnknown*>(oldEngine)); }
+				g_stoppedOnAudioThread = nullptr;
 				CallGameSlot(audio, kSlotShutdown, &seh);
+				if (!seh.code && IsRetired(oldEngine)) { SettleRetiredEngine(static_cast<IXAudio2*>(oldEngine)); }
 			}
 			else if (repaired)
 			{
-				for (IUnknown* e : std::vector<IUnknown*>(g_heldEngines)) { PinEngine(e); }
+				std::vector<IUnknown*> held;
+				for (const HeldEngine& h : g_heldEngines) { held.push_back(h.engine); }
+				for (IUnknown* e : held) { PinEngine(e); }
 			}
 			else { logger::info("the game has no audio engine (an earlier rebuild could not create one); its shutdown is skipped"); }
 			{
@@ -2139,6 +2394,39 @@ namespace audioswitch
 		logger::info("DevBench tool: the next engine initialisation will fail on purpose");
 	}
 
+	std::string ForeignCallTest()
+	{
+		// DevBench op=foreigncall: what Dragonborn ReVoiced did in phbd01's crash (2026-10-03). Keep the game's engine
+		// pointer WITHOUT a reference, let a switch happen, then call CreateSourceVoice on the kept pointer from a thread
+		// that is not the audio thread. 1.0.4 freed that engine at the switch, so this call crashed in XAudio2_7; from
+		// 1.0.5 the engine is retired (never freed) and the call is refused. A call on the live engine from the same
+		// thread must still succeed.
+		IXAudio2* const kept = LiveEngine();
+		if (!kept) {
+			return R"("error":"no live engine - load a game first")";
+		}
+		RequestReset("DevBench tool: foreign-call test (a switch with another mod holding the engine)", true);
+		const bool idle = WaitIdle(10000);
+		IXAudio2* const live = LiveEngine();
+		HRESULT hrKept = E_PENDING, hrLive = E_PENDING;
+		std::thread([&] {
+			WAVEFORMATEX fmt{ WAVE_FORMAT_PCM, 1, 44100, 88200, 2, 16, 0 };
+			IXAudio2Voice* voice = nullptr;
+			hrKept = kept->CreateSourceVoice(&voice, &fmt, 0, 2.0f, nullptr, nullptr, nullptr);
+			if (SUCCEEDED(hrKept) && voice) { voice->DestroyVoice(); }
+			voice = nullptr;
+			if (live) {
+				hrLive = live->CreateSourceVoice(&voice, &fmt, 0, 2.0f, nullptr, nullptr, nullptr);
+				if (SUCCEEDED(hrLive) && voice) { voice->DestroyVoice(); }
+			}
+		}).join();
+		logger::info("DevBench tool: foreign-call test - kept engine {} ({}), call on it 0x{:08X}; live engine {}, call on it 0x{:08X}",
+			Ptr(kept), IsRetired(kept) ? "retired" : "not retired", static_cast<std::uint32_t>(hrKept), Ptr(live), static_cast<std::uint32_t>(hrLive));
+		return std::format(R"("idle":{},"keptEngine":"{}","keptRetired":{},"keptSameAsLive":{},"hrKept":"0x{:08X}","liveEngine":"{}","hrLive":"0x{:08X}")",
+			idle ? "true" : "false", Ptr(kept), IsRetired(kept) ? "true" : "false", kept == live ? "true" : "false",
+			static_cast<std::uint32_t>(hrKept), Ptr(live), static_cast<std::uint32_t>(hrLive));
+	}
+
 	std::string StateJson()
 	{
 		State snap;
@@ -2148,12 +2436,12 @@ namespace audioswitch
 		}
 		std::scoped_lock l(g_wakeLock);
 		return std::format(
-			"\"hooks\":{{\"installed\":{},\"result\":\"{}\",\"audioThread\":{},\"audioThreadResult\":\"{}\",\"initializeCalls\":{},\"deviceCountCalls\":{},\"voiceGuard\":\"{}\",\"soundsSkippedNoEngine\":{},\"heldEngines\":{},\"pinnedEngines\":{},\"createCall\":\"{}\",\"otherModEngine\":\"{}\",\"xaudio2DeadlockGuard\":\"{}\",\"xaudio2DeadlocksAvoided\":{}}},"
+			"\"hooks\":{{\"installed\":{},\"result\":\"{}\",\"audioThread\":{},\"audioThreadResult\":\"{}\",\"initializeCalls\":{},\"deviceCountCalls\":{},\"voiceGuard\":\"{}\",\"soundsSkippedNoEngine\":{},\"heldEngines\":{},\"pinnedEngines\":{},\"retiredEngines\":{},\"refusedRetiredCalls\":{},\"unserialisedCalls\":{},\"createCall\":\"{}\",\"otherModEngine\":\"{}\",\"xaudio2DeadlockGuard\":\"{}\",\"xaudio2DeadlocksAvoided\":{}}},"
 			"\"worker\":{{\"result\":\"{}\",\"pending\":{},\"busy\":{},\"swapPending\":{},\"requests\":{},\"runs\":{},\"lastReason\":\"{}\"}},"
 			"\"engines\":[{{\"audioObject\":\"{}\",\"engine\":\"{}\",\"master\":\"{}\",\"attached\":{},\"device\":\"{}\",\"deviceId\":\"{}\",\"channels\":{},\"rate\":{},"
 			"\"passes\":{},\"critical\":{},\"criticalErrors\":{},\"resets\":{},\"failures\":{},\"lastResult\":\"{}\"}}]",
 			g_hooked.load() ? "true" : "false", EscapeJson(g_installResult), g_threadHooked.load() ? "true" : "false", EscapeJson(g_threadHookResult),
-			g_initializeCalls.load(), g_deviceCountCalls.load(), EscapeJson(g_voiceGuardResult), g_nullEngineSkips.load(), g_heldCount.load(), g_pinnedEngines.size(), EscapeJson(g_createCallState), OtherModEngineText(), EscapeJson(g_leapGuardResult), g_leapCollisions.load(), EscapeJson(g_watcherResult), g_pending ? "true" : "false", g_busy ? "true" : "false",
+			g_initializeCalls.load(), g_deviceCountCalls.load(), EscapeJson(g_voiceGuardResult), g_nullEngineSkips.load(), g_heldCount.load(), g_pinnedEngines.size(), g_retiredCount.load(), g_refusedCalls.load(), g_unserialisedCalls.load(), EscapeJson(g_createCallState), OtherModEngineText(), EscapeJson(g_leapGuardResult), g_leapCollisions.load(), EscapeJson(g_watcherResult), g_pending ? "true" : "false", g_busy ? "true" : "false",
 			g_swapPending.load() ? "true" : "false", g_requests, g_runs, EscapeJson(g_lastReason), Ptr(snap.audio), Ptr(snap.engine), Ptr(snap.master),
 			snap.master ? "true" : "false", EscapeJson(snap.deviceName), EscapeJson(snap.deviceId), snap.channels, snap.rate, g_passes.load(),
 			g_critical.load() ? "true" : "false", g_criticalCount.load(), snap.switches, snap.failures, EscapeJson(snap.lastResult));

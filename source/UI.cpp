@@ -4,6 +4,7 @@
 #include "UI.h"
 
 #include "SKSEMenuFramework.h"
+#include "PreciseSlider.h"
 
 #include "AudioSwitch.h"
 #include "KeyboardAccess.h"
@@ -43,7 +44,7 @@ namespace UI
 		{
 			constexpr const char* required[] = {
 				"AddSectionItem", "igTextV", "igTextDisabledV", "igTextWrappedV", "igSetTooltipV", "igSeparatorText",
-				"igCombo_Str_arr", "igSliderFloat", "igIsKeyPressed_Bool", "igIsItemClicked", "igIsItemActive",
+				"igCombo_Str_arr", "igSliderFloat", "igIsKeyPressed_Bool", "igIsKeyDown_Nil", "igIsMouseDown_Nil", "igIsItemClicked", "igIsItemActive",
 				"igIsItemHovered", "igButton", "igSameLine", "igSpacing", "igPushItemWidth", "igPopItemWidth",
 				// utils/Toggle.h
 				"igGetCursorScreenPos", "igGetWindowDrawList", "igGetFrameHeight", "igInvisibleButton", "igPushID_Str",
@@ -69,10 +70,14 @@ namespace UI
 
 		bool NudgeableSlider(const char* a_label, float* a_value, float a_min, float a_max, const char* a_format, float a_step, bool* a_active = nullptr)
 		{
-			bool changed = ImGuiMCP::SliderFloat(a_label, a_value, a_min, a_max, a_format);
-			if (a_active) { *a_active = ImGuiMCP::IsItemActive(); }
-			if (ImGuiMCP::IsItemClicked() || ImGuiMCP::IsItemActive()) { selectedSlider = a_label; }
-			if (selectedSlider == a_label)
+			// rule 68 (sliders-are-precise): ImGui's own nudge of an activated slider is held to one unit by precise::, and
+			// this page's arrow nudge of the selected slider moves one unit too - but only while ImGui is NOT driving the
+			// slider itself, so one press is never counted twice
+			bool changed = precise::SliderFloat(a_label, a_value, a_min, a_max, a_format);
+			const bool imguiDriven = ImGuiMCP::IsItemActive();
+			if (a_active) { *a_active = imguiDriven; }
+			if (ImGuiMCP::IsItemClicked() || imguiDriven) { selectedSlider = a_label; }
+			if (selectedSlider == a_label && !imguiDriven)
 			{
 				float nudge = 0.0F;
 				if (ImGuiMCP::IsKeyPressed(ImGuiMCP::ImGuiKey_LeftArrow) || ImGuiMCP::IsKeyPressed(ImGuiMCP::ImGuiKey_DownArrow)) { nudge -= a_step; }
@@ -142,7 +147,7 @@ namespace UI
 			static std::chrono::steady_clock::time_point s_levelChanged{};
 			if (!s_levelActive && now - s_levelChanged > std::chrono::milliseconds(600)) { s_level = std::round(v.level * 100.0F); }
 			bool active = false;
-			if (NudgeableSlider(strings::TR("AAOS_VolumeLevel", "Volume"), &s_level, 0.0F, 100.0F, "%.0f %%", 2.0F, &active))
+			if (NudgeableSlider(strings::TR("AAOS_VolumeLevel", "Volume"), &s_level, 0.0F, 100.0F, "%.0f %%", 1.0F, &active))
 			{
 				volume::SetLevel(s_level / 100.0F);
 				s_levelChanged = now;
@@ -224,7 +229,7 @@ namespace UI
 			HelpMarker(strings::TR("AAOS_HelpSwitchToNew", "When an output device is connected after the game has started - a headset plugged in or switched on - the game's sound moves to it. A connected preferred device still comes first."));
 
 			float delay = static_cast<float>(general::resetDelayMs.load());
-			if (NudgeableSlider(strings::TR("AAOS_Delay", "Switch delay"), &delay, 0.0F, 5000.0F, "%.0f ms", 100.0F))
+			if (NudgeableSlider(strings::TR("AAOS_Delay", "Switch delay"), &delay, 0.0F, 5000.0F, "%.0f ms", 1.0F))
 			{
 				general::resetDelayMs = static_cast<std::uint32_t>(delay);
 			}

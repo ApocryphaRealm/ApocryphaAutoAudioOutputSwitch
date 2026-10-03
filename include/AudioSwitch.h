@@ -54,6 +54,7 @@ namespace audioswitch
 	// For the DevBench tool: the next engine initialisation fails on purpose, leaving the game with no audio engine (a
 	// rebuild on a device that cannot take audio yet) - sounds must be skipped, not crash, and a later switch recovers.
 	void FailNextEngineInit();
+	std::string ForeignCallTest();                    // DevBench op=foreigncall: another mod's call on an engine kept across a switch
 	std::string StateJson();                          // engines, hooks, counters
 	std::string DevicesJson();                        // XAudio2 device list (from a live engine) and Windows endpoints
 	void LogSummary(std::string_view a_when);

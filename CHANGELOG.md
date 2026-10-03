@@ -1,5 +1,40 @@
 # Changelog
 
+## 1.0.5 - 2026-10-03 - working
+
+### Fixed
+- **A crash after switching devices with Dragonborn ReVoiced installed** (phbd01, Nexus, 2026-10-03: *"when i switch
+  headphones to speakers"*; AE 1.6.1170, `XAudio2_7.dll+0x26817` under this mod's `CreateSourceVoice` hook, called from
+  `DBReV.dll` on the Papyrus thread). DBReV (Nexus 184221) keeps the game's XAudio2 engine pointer and creates its voices
+  on it. A switch rebuilds the game's engine; this mod kept the old one alive through the rebuild and then let it go, so
+  DBReV's next voiced line called an engine that had been destroyed. Every engine the game lets go at a switch is now
+  kept for the rest of the session (stopped, with no output), so a pointer another mod kept never reaches freed memory.
+  A request from another mod to create a voice on such an engine is refused with XAudio2's own "invalid call" error
+  instead of reaching it, so the mod can fall back (DBReV has its Legacy Playback) rather than play into an engine that
+  no longer sounds. The cost is one idle engine per switch.
+- Voice creation from other mods' threads now waits for a switch in progress (at most half a second) instead of running
+  inside the game's audio shutdown.
+- The Volume and Switch delay sliders move exactly one unit per arrow-key or D-pad press (they jumped 2 % and 100 ms,
+  and a press on a slider ImGui was already moving counted twice).
+
+### Tested (2026-10-03, SE 1.5.97, Njordlinger Test)
+- phbd01's crash reproduced on 1.0.4 with DBReV 1.5.2 and a voice pack: two switches, then a DBReV line -
+  `EXCEPTION_ACCESS_VIOLATION` in XAudio2_7 under `AutoAudioOutputSwitch.dll+0x4B61`, called from `DBReV.dll+0x4D544`,
+  the same frames as the report. The same sequence on 1.0.5 (two switches, four lines): no crash, each call on the old
+  engine refused, DBReV handed the line to the game's own playback.
+- A real Bluetooth headset disconnected and reconnected in play: switched to the speakers and back, no sound skipped.
+- DevBench `aaos.control op=foreigncall` (new, for testing): keeps the live engine's pointer the way DBReV does, forces a
+  switch, then calls CreateSourceVoice on the kept pointer and on the new engine from another thread - refused
+  (0x88960001) and succeeded (0x00000000).
+
+### Changed
+- The log names every module that creates voices on the game's engine from another thread (once per engine and
+  module), each engine retired at a switch and which modules were seen using it, each refused call (the first, then
+  every 100th), and each engine released after a rebuild. DevBench `aaos.control` reports `retiredEngines`,
+  `refusedRetiredCalls` and `unserialisedCalls`.
+- The shipped log level is info (`uLogLevel=2`), in the INI and the compiled default, as every mod of this project now
+  ships (it was trace). Set 0 before reproducing a bug you report.
+
 ## 1.0.4 - 2026-09-18 - untested
 
 ### Fixed

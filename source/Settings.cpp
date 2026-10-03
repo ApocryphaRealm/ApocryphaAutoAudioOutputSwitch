@@ -270,7 +270,7 @@ namespace settings
 	void RestoreDefaults()
 	{
 		// The compiled defaults, which the shipped INI repeats (rule 16).
-		debug::logLevel = 0;
+		debug::logLevel = 2;
 		general::enabled = true;
 		general::switchOnDefaultChange = true;
 		general::switchToNewDevice = true;
