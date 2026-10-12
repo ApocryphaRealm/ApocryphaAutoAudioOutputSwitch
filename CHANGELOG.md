@@ -1,6 +1,6 @@
 # Changelog
 
-## 1.0.6 - 2026-10-11 - untested
+## 1.0.6 - 2026-10-11 - working
 
 ### Fixed
 - The Log level help text on the settings page named the pre-rename log file (ApocryphaAutoAudioOutputSwitch.log) in all eleven languages; it now names the file the plugin writes since 1.0.3, Documents\My Games\Skyrim Special Edition\SKSE\AutoAudioOutputSwitch.log. The translation files were never regenerated after the 1.0.3 rename (the English compiled fallback in UI.cpp was already right).
