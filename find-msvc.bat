@@ -27,5 +27,8 @@ set "PATH=%VSPATH%\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin;%VSPAT
 REM Optional machine-wide build settings, named by the MODS_BUILD_ENV environment variable (TEMP
 REM outside the user profile, a vcpkg overlay triplet that strips build paths from the binaries).
 REM Where it is unset the build runs unchanged.
+REM A shell started before MODS_BUILD_ENV was set does not have it in its environment, so it is
+REM read from the user's saved variables (HKCU\Environment) when the process lacks it.
+if not defined MODS_BUILD_ENV for /f "tokens=2,*" %%A in ('reg query "HKCU\Environment" /v MODS_BUILD_ENV 2^>nul ^| findstr /i /c:"MODS_BUILD_ENV"') do call set "MODS_BUILD_ENV=%%B"
 if defined MODS_BUILD_ENV if exist "%MODS_BUILD_ENV%" call "%MODS_BUILD_ENV%"
 exit /b 0
