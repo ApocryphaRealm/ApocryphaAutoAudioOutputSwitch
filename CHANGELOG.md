@@ -5,6 +5,9 @@
 ### Fixed
 - The Log level help text on the settings page named the pre-rename log file (ApocryphaAutoAudioOutputSwitch.log) in all eleven languages; it now names the file the plugin writes since 1.0.3, Documents\My Games\Skyrim Special Edition\SKSE\AutoAudioOutputSwitch.log. The translation files were never regenerated after the 1.0.3 rename (the English compiled fallback in UI.cpp was already right).
 
+### Changed
+- Built so the DLL and PDB carry no build-machine paths: no user folder and no project folder (the linker's temp files and CommonLibSSE-NG's own sources are now built outside / trimmed from them).
+
 ## 1.0.5 - 2026-10-03 - working
 
 ### Fixed
