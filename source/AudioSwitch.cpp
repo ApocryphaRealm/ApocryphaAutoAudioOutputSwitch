@@ -1504,6 +1504,359 @@ namespace audioswitch
 			return hr;
 		}
 
+		// ---- controller rumble from sound (1.0.7) ----
+		// Skyrim drives the controller's motors from sound as well as from timed shakes: a sound whose descriptor has a rumble
+		// send and whose output model allows rumble is also sent to one of two "rumble mixers" - a submix voice carrying a
+		// level-meter effect, made through BSXAudio2Audio vfunc 8 (SE 66712) and kept in the output-mixer table (list A). The
+		// game's rumble module makes the pair ONCE, at startup (SE 32312 / AE 33056): it stores the two slot indices and,
+		// through vfunc 10 (SE 66714), a raw pointer to each mixer's measured level (effect object +0x34). Every frame
+		// (SE 32314) it copies those two levels into its two continuous motor entries, which Rumble::Update (SE 67223) sends
+		// to XInputSetState together with the timed rumbles. The game's audio shutdown destroys both voices and deletes both
+		// effect objects, its init never makes them again, and the switch empties the table - so after a switch, before
+		// 1.0.7, every rumble send was dropped as an empty output and the module read its two levels from freed memory: the
+		// controller stopped vibrating for everything sound-driven until the game was restarted (Nexus: SHD156, 2026-09-19;
+		// Burugromalog, 2026-10-15). Found by disassembling the three runtimes (falsification episode 57).
+		//
+		// The switch now does around its rebuild what the game does around its own audio: before the shutdown, the game's
+		// release (SE 32313 / AE 33057 - what it calls before shutting audio down at exit) hands both mixers back and stops
+		// the module reading them, and the game's "sound rumble off" (32316 / 33060) zeroes both motor entries, so a motor
+		// that was running cannot stay on while the rebuild runs or if it fails; the module's on/off state (off while the
+		// game is paused or in the background) is put back as it was (32315 / 33059). After a successful init the two mixers
+		// are made again through the same vfuncs 8 and 10, into the same globals, in the startup function's order, and the
+		// module reads them again. Its two motor entries belong to the input side (Rumble), not to the audio engine, so they
+		// are kept: the startup function's two AddContinuous calls are the only part of it not repeated. No input device is
+		// touched. Every address is checked at load against the startup function's own code (Install), and anything that
+		// does not match leaves rumble exactly as the game has it.
+		struct RumbleAddresses
+		{
+			std::uintptr_t create{ 0 };       // SE 32312 / AE 33056: the startup function (decoded at load, never called)
+			std::uintptr_t release{ 0 };      // SE 32313 / AE 33057
+			std::uintptr_t enable{ 0 };       // SE 32315 / AE 33059: the module reads the levels (flag B = 1)
+			std::uintptr_t disable{ 0 };      // SE 32316 / AE 33060: both motor entries to 0, flag B = 0
+			std::uintptr_t audioGlobal{ 0 };  // SE 523573 / AE 410109: the BSXAudio2Audio* the module uses
+			std::uintptr_t slot[2]{};         // SE 508477, 508478 / AE 380154, 380155: mixer slot indices (uint32)
+			std::uintptr_t level[2]{};        // SE 516452, 516453 / AE 402632, 402633: float* to each mixer's level
+			std::uintptr_t registered{ 0 };   // SE 516450 / AE 402630: flag A, the mixers exist
+			std::uintptr_t processing{ 0 };   // SE 516451 / AE 402631: flag B, the levels are read each frame
+		};
+		RumbleAddresses g_rumble;
+		bool g_rumbleReady = false;                       // written once in Install
+		std::string g_rumbleInstall{ "not run" };         // written once in Install
+		std::atomic<bool> g_rumblePending{ false };       // released by a switch and not made again yet
+		std::atomic<std::uint32_t> g_rumbleReleases{ 0 };
+		std::atomic<std::uint32_t> g_rumbleRestores{ 0 };
+		std::atomic<std::uint32_t> g_rumbleOldSlot[2]{};  // the slots the mixers had when they were released
+		std::mutex g_rumbleTextLock;
+		std::string g_rumbleLast{ "no switch yet" };      // guarded by g_rumbleTextLock
+
+		void SetRumbleText(std::string a_text)
+		{
+			std::scoped_lock l(g_rumbleTextLock);
+			g_rumbleLast = std::move(a_text);
+		}
+
+		std::string RumbleText()
+		{
+			std::scoped_lock l(g_rumbleTextLock);
+			return g_rumbleLast;
+		}
+
+		// Rip-relative targets found in a function's first bytes. POD only (SEH).
+		struct RipTargets
+		{
+			std::uintptr_t storeEax[4]{};   // 89 05 d32        mov dword ptr [rip+d], eax
+			int storeEaxCount{ 0 };
+			std::uintptr_t leaRdx[4]{};     // 48 8D 15 d32     lea rdx, [rip+d]
+			int leaRdxCount{ 0 };
+			std::uintptr_t setByte1[4]{};   // C6 05 d32 01     mov byte ptr [rip+d], 1
+			int setByte1Count{ 0 };
+			std::uintptr_t setByte0[4]{};   // C6 05 d32 00     mov byte ptr [rip+d], 0
+			int setByte0Count{ 0 };
+			std::uintptr_t cmpByte0[4]{};   // 80 3D d32 00     cmp byte ptr [rip+d], 0
+			int cmpByte0Count{ 0 };
+			bool callRdx40{ false };        // FF 52 40         call [rdx+0x40] (vfunc 8)
+			bool callRax50{ false };        // FF 50 50         call [rax+0x50] (vfunc 10)
+		};
+
+		// Scans a_len bytes from a_fn; stops early once a_stopAfterSet1 "mov byte [rip+d], 1" were seen (0: never).
+		// Returns false when reading faulted.
+		bool ScanRipTargets(std::uintptr_t a_fn, std::size_t a_len, int a_stopAfterSet1, RipTargets* a_out)
+		{
+			__try
+			{
+				const auto* p = reinterpret_cast<const std::uint8_t*>(a_fn);
+				for (std::size_t i = 0; i + 8 <= a_len; ++i)
+				{
+					std::int32_t d = 0;
+					if (p[i] == 0x89 && p[i + 1] == 0x05)
+					{
+						std::memcpy(&d, p + i + 2, 4);
+						if (a_out->storeEaxCount < 4) { a_out->storeEax[a_out->storeEaxCount++] = a_fn + i + 6 + static_cast<std::intptr_t>(d); }
+					}
+					else if (p[i] == 0x48 && p[i + 1] == 0x8D && p[i + 2] == 0x15)
+					{
+						std::memcpy(&d, p + i + 3, 4);
+						if (a_out->leaRdxCount < 4) { a_out->leaRdx[a_out->leaRdxCount++] = a_fn + i + 7 + static_cast<std::intptr_t>(d); }
+					}
+					else if (p[i] == 0xC6 && p[i + 1] == 0x05 && (p[i + 6] == 0 || p[i + 6] == 1))
+					{
+						std::memcpy(&d, p + i + 2, 4);
+						const std::uintptr_t t = a_fn + i + 7 + static_cast<std::intptr_t>(d);
+						if (p[i + 6] == 1 && a_out->setByte1Count < 4) { a_out->setByte1[a_out->setByte1Count++] = t; }
+						if (p[i + 6] == 0 && a_out->setByte0Count < 4) { a_out->setByte0[a_out->setByte0Count++] = t; }
+					}
+					else if (p[i] == 0x80 && p[i + 1] == 0x3D && p[i + 6] == 0)
+					{
+						std::memcpy(&d, p + i + 2, 4);
+						if (a_out->cmpByte0Count < 4) { a_out->cmpByte0[a_out->cmpByte0Count++] = a_fn + i + 7 + static_cast<std::intptr_t>(d); }
+					}
+					if (p[i] == 0xFF && p[i + 1] == 0x52 && p[i + 2] == 0x40) { a_out->callRdx40 = true; }
+					if (p[i] == 0xFF && p[i + 1] == 0x50 && p[i + 2] == 0x50) { a_out->callRax50 = true; }
+					if (a_stopAfterSet1 > 0 && a_out->setByte1Count >= a_stopAfterSet1) { break; }
+				}
+				return true;
+			}
+			__except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+		}
+
+		std::uint8_t ReadByteSafe(std::uintptr_t a_addr)
+		{
+			__try { return *reinterpret_cast<volatile std::uint8_t*>(a_addr); }
+			__except (EXCEPTION_EXECUTE_HANDLER) { return 0xFF; }
+		}
+
+		void WriteByteSafe(std::uintptr_t a_addr, std::uint8_t a_value)
+		{
+			__try { *reinterpret_cast<volatile std::uint8_t*>(a_addr) = a_value; }
+			__except (EXCEPTION_EXECUTE_HANDLER) {}
+		}
+
+		std::uint32_t ReadU32Safe(std::uintptr_t a_addr)
+		{
+			__try { return *reinterpret_cast<volatile std::uint32_t*>(a_addr); }
+			__except (EXCEPTION_EXECUTE_HANDLER) { return 0xFFFFFFFFu; }
+		}
+
+		bool CallGameVoid(std::uintptr_t a_fn, SehInfo* a_seh)
+		{
+			__try
+			{
+				reinterpret_cast<void (*)()>(a_fn)();
+				return true;
+			}
+			__except (FillSeh(GetExceptionInformation(), a_seh)) { return false; }
+		}
+
+		// The startup function's mixer half, through the audio object's own vfuncs 8 (make a mixer -> slot) and 10 (pointer
+		// to a slot's level, written to the out pointer), into the module's own globals, in its order. False on a fault.
+		bool MakeRumbleMixers(void* a_audio, std::uint32_t* a_slots, SehInfo* a_seh)
+		{
+			__try
+			{
+				void** vtbl = *reinterpret_cast<void***>(a_audio);
+				auto make = reinterpret_cast<std::uint32_t (*)(void*)>(vtbl[8]);
+				auto levelOf = reinterpret_cast<void* (*)(void*, void*, std::uint32_t)>(vtbl[10]);
+				a_slots[0] = make(a_audio);
+				*reinterpret_cast<volatile std::uint32_t*>(g_rumble.slot[0]) = a_slots[0];
+				a_slots[1] = make(a_audio);
+				*reinterpret_cast<volatile std::uint32_t*>(g_rumble.slot[1]) = a_slots[1];
+				levelOf(a_audio, reinterpret_cast<void*>(g_rumble.level[0]), a_slots[0]);
+				levelOf(a_audio, reinterpret_cast<void*>(g_rumble.level[1]), a_slots[1]);
+				return true;
+			}
+			__except (FillSeh(GetExceptionInformation(), a_seh)) { return false; }
+		}
+
+		// List A slot a_slot: its effect object and voice. False when the slot is empty, out of range or unreadable.
+		bool MixerSlot(std::uint32_t a_slot, void** a_effect, void** a_voice)
+		{
+			*a_effect = nullptr;
+			*a_voice = nullptr;
+			__try
+			{
+				auto* head = reinterpret_cast<std::uint8_t*>(g_addr.voiceListA);
+				const std::int32_t flags = *reinterpret_cast<std::int32_t*>(head);
+				const std::uint32_t count = *reinterpret_cast<std::uint32_t*>(head + kVoiceListCount);
+				auto* data = flags < 0 ? head + 8 : *reinterpret_cast<std::uint8_t**>(head + 8);
+				if (!data || a_slot >= count || count > 0x4000) { return false; }
+				*a_effect = *reinterpret_cast<void**>(data + static_cast<std::size_t>(a_slot) * 0x10);
+				*a_voice = *reinterpret_cast<void**>(data + static_cast<std::size_t>(a_slot) * 0x10 + 8);
+				return *a_effect && *a_voice;
+			}
+			__except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+		}
+
+		float ReadLevelSafe(void* a_level)
+		{
+			if (!a_level) { return -1.0f; }
+			__try { return *static_cast<volatile float*>(a_level); }
+			__except (EXCEPTION_EXECUTE_HANDLER) { return -1.0f; }
+		}
+
+		// Install: resolve the module's functions and globals, and accept them only when the startup, release, on and off
+		// functions' own code names exactly those globals (rule 30: ask the code, do not infer it from an ID table).
+		void InstallRumble()
+		{
+			g_rumble.create = REL::RelocationID(32312, 33056).address();
+			g_rumble.release = REL::RelocationID(32313, 33057).address();
+			g_rumble.enable = REL::RelocationID(32315, 33059).address();
+			g_rumble.disable = REL::RelocationID(32316, 33060).address();
+			g_rumble.audioGlobal = REL::RelocationID(523573, 410109).address();
+			g_rumble.slot[0] = REL::RelocationID(508477, 380154).address();
+			g_rumble.slot[1] = REL::RelocationID(508478, 380155).address();
+			g_rumble.level[0] = REL::RelocationID(516452, 402632).address();
+			g_rumble.level[1] = REL::RelocationID(516453, 402633).address();
+			g_rumble.registered = REL::RelocationID(516450, 402630).address();
+			g_rumble.processing = REL::RelocationID(516451, 402631).address();
+
+			RipTargets create{}, release{}, enable{}, disable{};
+			const bool read = ScanRipTargets(g_rumble.create, 0x100, 2, &create) && ScanRipTargets(g_rumble.release, 0x10, 0, &release) &&
+							  ScanRipTargets(g_rumble.enable, 0x10, 1, &enable) && ScanRipTargets(g_rumble.disable, 0x100, 0, &disable);
+			const auto base = REL::Module::get().base();
+			std::string mismatch;
+			auto expect = [&](bool a_ok, const char* a_what) {
+				if (!a_ok) { mismatch += mismatch.empty() ? a_what : std::string(", ") + a_what; }
+			};
+			expect(read, "the code could not be read");
+			expect(create.storeEaxCount >= 2 && create.storeEax[0] == g_rumble.slot[0] && create.storeEax[1] == g_rumble.slot[1], "mixer slot globals");
+			expect(create.leaRdxCount >= 2 && create.leaRdx[0] == g_rumble.level[0] && create.leaRdx[1] == g_rumble.level[1], "mixer level pointers");
+			expect(create.setByte1Count >= 2 && create.setByte1[0] == g_rumble.registered && create.setByte1[1] == g_rumble.processing, "module flags");
+			expect(create.callRdx40 && create.callRax50, "vfunc 8 / vfunc 10 calls");
+			expect(release.cmpByte0Count >= 1 && release.cmpByte0[0] == g_rumble.registered, "release checks the mixers flag");
+			expect(enable.setByte1Count >= 1 && enable.setByte1[0] == g_rumble.processing, "on sets the module flag");
+			bool offClears = false;
+			for (int i = 0; i < disable.setByte0Count; ++i) { offClears = offClears || disable.setByte0[i] == g_rumble.processing; }
+			expect(offClears, "off clears the module flag");
+
+			if (!mismatch.empty())
+			{
+				g_rumbleInstall = std::format("not active: the game's rumble module did not match ({}); controller rumble from sound stops after a switch, as before 1.0.7", mismatch);
+				logger::warn("rumble: {}", g_rumbleInstall);
+				return;
+			}
+			g_rumbleReady = true;
+			g_rumbleInstall = std::format("active: rumble mixers in slots at +0x{:X}/+0x{:X}, levels at +0x{:X}/+0x{:X}, flags +0x{:X}/+0x{:X}; made again after every switch",
+				g_rumble.slot[0] - base, g_rumble.slot[1] - base, g_rumble.level[0] - base, g_rumble.level[1] - base, g_rumble.registered - base, g_rumble.processing - base);
+			logger::info("rumble: {}", g_rumbleInstall);
+		}
+
+		// Audio thread, before the game's shutdown in a switch.
+		void ReleaseRumbleMixers(void* a_audio)
+		{
+			if (!g_rumbleReady) { return; }
+			const std::uint8_t registered = ReadByteSafe(g_rumble.registered);
+			if (registered != 1)
+			{
+				logger::debug("rumble: the game has no rumble mixers to hand back (flag {}; {} from an earlier switch)", registered, g_rumblePending.load() ? "still to be made again" : "none pending");
+				return;
+			}
+			void* moduleAudio = ReadPtr(reinterpret_cast<void*>(g_rumble.audioGlobal), 0);
+			if (moduleAudio != a_audio)
+			{
+				logger::warn("rumble: the rumble module's audio object {} is not the one being rebuilt ({}); its mixers are left alone", Ptr(moduleAudio), Ptr(a_audio));
+				return;
+			}
+			const std::uint8_t processing = ReadByteSafe(g_rumble.processing);
+			g_rumbleOldSlot[0] = ReadU32Safe(g_rumble.slot[0]);
+			g_rumbleOldSlot[1] = ReadU32Safe(g_rumble.slot[1]);
+			SehInfo seh{};
+			if (!CallGameVoid(g_rumble.release, &seh))
+			{
+				LogFault("rumble release", seh);
+				SetRumbleText("the game's rumble release faulted before the switch; rumble from sound may stop until restart");
+				return;
+			}
+			g_rumblePending = true;
+			++g_rumbleReleases;
+			bool zeroed = CallGameVoid(g_rumble.disable, &seh);
+			if (!zeroed) { LogFault("rumble off", seh); }
+			if (processing == 1)
+			{
+				seh = {};
+				if (!CallGameVoid(g_rumble.enable, &seh))
+				{
+					LogFault("rumble on", seh);
+					WriteByteSafe(g_rumble.processing, 1);
+				}
+			}
+			logger::debug("rumble: mixers in slots {}/{} handed back to the game before its shutdown; motors {}; module {}", g_rumbleOldSlot[0].load(), g_rumbleOldSlot[1].load(),
+				zeroed ? "zeroed" : "NOT zeroed (fault)", processing == 1 ? "on" : "off (game paused or in the background)");
+		}
+
+		// Audio thread, after a successful init in a switch and before the surviving sounds get their voices back (so their
+		// rumble sends find the mixers).
+		void RestoreRumbleMixers(void* a_audio)
+		{
+			if (!g_rumbleReady || !g_rumblePending.load()) { return; }
+			void* moduleAudio = ReadPtr(reinterpret_cast<void*>(g_rumble.audioGlobal), 0);
+			if (moduleAudio != a_audio)
+			{
+				logger::warn("rumble: the rumble module's audio object {} is not the rebuilt one ({}); its mixers are not made again", Ptr(moduleAudio), Ptr(a_audio));
+				SetRumbleText("not made again: the rumble module uses another audio object");
+				return;
+			}
+			if (ReadByteSafe(g_rumble.registered) == 1)
+			{
+				g_rumblePending = false;
+				logger::info("rumble: the game already made its rumble mixers again; nothing to do");
+				return;
+			}
+			std::uint32_t slots[2]{ 0xFFFFFFFFu, 0xFFFFFFFFu };
+			SehInfo seh{};
+			if (!MakeRumbleMixers(a_audio, slots, &seh))
+			{
+				LogFault("rumble mixers", seh);
+				SetRumbleText("making the rumble mixers again faulted; rumble from sound stays off until restart");
+				g_rumblePending = false;
+				return;
+			}
+			std::atomic_thread_fence(std::memory_order_release);
+			WriteByteSafe(g_rumble.registered, 1);
+			g_rumblePending = false;
+			++g_rumbleRestores;
+			void* effect[2]{};
+			void* voice[2]{};
+			bool live[2]{};
+			void* level[2]{};
+			for (int i = 0; i < 2; ++i)
+			{
+				live[i] = MixerSlot(slots[i], &effect[i], &voice[i]);
+				level[i] = ReadPtr(reinterpret_cast<void*>(g_rumble.level[i]), 0);
+				live[i] = live[i] && level[i] == static_cast<std::uint8_t*>(effect[i]) + 0x34;
+			}
+			const std::string text = std::format("rumble mixers made again in slots {}/{} (were {}/{}): {}, {}", slots[0], slots[1], g_rumbleOldSlot[0].load(), g_rumbleOldSlot[1].load(),
+				live[0] ? "first live" : "first NOT live", live[1] ? "second live" : "second NOT live");
+			SetRumbleText(text);
+			if (live[0] && live[1]) { logger::info("rumble: {}", text); }
+			else { logger::warn("rumble: {} (a slot index of 0xFFFFFFFF means the game could not make that mixer; that motor gets no sound rumble)", text); }
+		}
+
+		std::string RumbleJson()
+		{
+			if (!g_rumbleReady)
+			{
+				return std::format(R"("rumble":{{"active":false,"install":"{}"}})", EscapeJson(g_rumbleInstall));
+			}
+			std::uint32_t slots[2]{ ReadU32Safe(g_rumble.slot[0]), ReadU32Safe(g_rumble.slot[1]) };
+			bool live[2]{};
+			float levels[2]{ -1.0f, -1.0f };
+			std::string pointers[2];
+			for (int i = 0; i < 2; ++i)
+			{
+				void* effect = nullptr;
+				void* voice = nullptr;
+				void* level = ReadPtr(reinterpret_cast<void*>(g_rumble.level[i]), 0);
+				live[i] = MixerSlot(slots[i], &effect, &voice) && level == static_cast<std::uint8_t*>(effect) + 0x34;
+				levels[i] = live[i] ? ReadLevelSafe(level) : -1.0f;
+				pointers[i] = Ptr(level);
+			}
+			return std::format(
+				R"("rumble":{{"active":true,"install":"{}","mixersFlag":{},"moduleOn":{},"pending":{},"releases":{},"restores":{},"slots":[{},{}],"levelPointers":["{}","{}"],"live":[{},{}],"levels":[{:.4f},{:.4f}],"last":"{}"}})",
+				EscapeJson(g_rumbleInstall), ReadByteSafe(g_rumble.registered), ReadByteSafe(g_rumble.processing), g_rumblePending.load() ? "true" : "false", g_rumbleReleases.load(),
+				g_rumbleRestores.load(), slots[0], slots[1], pointers[0], pointers[1], live[0] ? "true" : "false", live[1] ? "true" : "false", levels[0], levels[1],
+				EscapeJson(RumbleText()));
+		}
+
 		// ---- the switch, on the game's audio thread ----
 		void FinishSwap()
 		{
@@ -1593,6 +1946,9 @@ namespace audioswitch
 			g_swapStep = 2;
 			const int scrubbed = ScrubVoiceList(g_addr.voiceListA) + ScrubVoiceList(g_addr.voiceListB);
 
+			// 2b. the controller's sound-rumble mixers go back to the game first, as at its own exit (1.0.7, see above)
+			ReleaseRumbleMixers(audio);
+
 			// 3. the game's own shutdown and init; init creates the mastering voice through our hook on the target
 			SehInfo seh{};
 			g_swapStep = 3;
@@ -1667,6 +2023,8 @@ namespace audioswitch
 					logger::info("the rebuilt engine is stopped as well: another mod had stopped the game's sound (the game is in the background)");
 				}
 			}
+			// 3b. the controller's sound-rumble mixers on the new engine, before the sounds that send to them come back
+			RestoreRumbleMixers(audio);
 			g_swapStep = 5;
 			// 4. the game's own per-sound voice setup rebuilds every surviving sound on the new engine
 			int revived = 0;
@@ -2259,6 +2617,7 @@ namespace audioswitch
 		logger::info("game addresses: thread loop {:X}, sound processing {:X}, sound setup {:X}, voice lists {:X}/{:X}, audio object {:X}, audio vtable {:X}",
 					 g_addr.threadLoop, g_addr.processSounds, g_addr.setupSound, g_addr.voiceListA, g_addr.voiceListB, g_addr.audioObject, g_addr.audioVtable);
 		InstallVoiceGuard();
+		InstallRumble();
 		CheckEngineCreateCall();
 		logger::info("the game's engine-creation call at load: {}", g_createCallState);
 
@@ -2444,7 +2803,7 @@ namespace audioswitch
 			g_initializeCalls.load(), g_deviceCountCalls.load(), EscapeJson(g_voiceGuardResult), g_nullEngineSkips.load(), g_heldCount.load(), g_pinnedEngines.size(), g_retiredCount.load(), g_refusedCalls.load(), g_unserialisedCalls.load(), EscapeJson(g_createCallState), OtherModEngineText(), EscapeJson(g_leapGuardResult), g_leapCollisions.load(), EscapeJson(g_watcherResult), g_pending ? "true" : "false", g_busy ? "true" : "false",
 			g_swapPending.load() ? "true" : "false", g_requests, g_runs, EscapeJson(g_lastReason), Ptr(snap.audio), Ptr(snap.engine), Ptr(snap.master),
 			snap.master ? "true" : "false", EscapeJson(snap.deviceName), EscapeJson(snap.deviceId), snap.channels, snap.rate, g_passes.load(),
-			g_critical.load() ? "true" : "false", g_criticalCount.load(), snap.switches, snap.failures, EscapeJson(snap.lastResult));
+			g_critical.load() ? "true" : "false", g_criticalCount.load(), snap.switches, snap.failures, EscapeJson(snap.lastResult)) + "," + RumbleJson();
 	}
 
 	std::string DevicesJson()

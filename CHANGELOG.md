@@ -1,5 +1,27 @@
 # Changelog
 
+## 1.0.7 - 2026-10-16 - untested
+
+### Fixed
+- **Controller vibration stopped after an audio switch** (SHD156, Nexus, 2026-09-19: *"Switching audio in the game will
+  cause the controller's vibration to stop working"*; Burugromalog, 2026-10-15). Skyrim makes much of its rumble from
+  sound: a sound with a rumble send is also played into one of two "rumble mixers" (a submix voice with a level meter),
+  and the game's rumble module turns their levels into the two motors' strength every frame. The module makes the two
+  mixers once, at startup. A switch rebuilds the game's audio engine with the game's own shutdown and init: the shutdown
+  destroys both mixers, the init never makes them again, so from the first switch on every sound-driven rumble went
+  nowhere (and the module read its levels from freed memory). Timed rumble (scripted shakes) never went through the
+  mixers and is unaffected either way. Before the rebuild the switch now hands the two mixers back through the game's own release
+  (what the game does before it shuts audio down at exit) and zeroes both motors, so none can stay on; after a
+  successful rebuild it makes them again through the same game functions the startup uses, into the same places, before
+  the playing sounds come back. Input devices are not touched. Found by reading the game's code on SE 1.5.97,
+  AE 1.6.1170 and 1.7.104; every address is checked against the game's own code at load, and if anything does not match
+  rumble is left exactly as the game has it (and the log says so).
+
+### Changed
+- The DevBench state (`aaos.control`, every op) has a `rumble` block: whether the fix is active, the two mixers' slots,
+  whether each level pointer points at a live mixer, the current levels, and how many times the mixers were handed back
+  and made again. The log has one line per switch saying where the mixers were made again and whether both are live.
+
 ## 1.0.6 - 2026-10-11 - working
 
 ### Fixed
