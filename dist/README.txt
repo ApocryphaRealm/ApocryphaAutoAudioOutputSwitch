@@ -1,4 +1,4 @@
-﻿Auto Audio Output Switch 1.0.6
+﻿Auto Audio Output Switch 1.0.7
 
 SKSE plugin. Skyrim picks its audio output once, at startup, and goes silent if that device is unplugged. With this
 plugin the game moves its sound to another connected device when the one it plays on is unplugged, when you connect a
@@ -39,10 +39,15 @@ LICENCE
 GPL-3.0-or-later: LICENSE and NOTICE.md. Components under other licences, with their notices:
 THIRD_PARTY_NOTICES.md.
 
-WHAT CHANGED IN 1.0.6
-  - The Log level help on the settings page names the right log file, AutoAudioOutputSwitch.log, in all eleven
-    languages (it still named the file from before the 1.0.3 rename).
+WHAT CHANGED IN 1.0.7
+  - Controller vibration keeps working after a switch. Skyrim makes much of its rumble from sound, through two
+    "rumble mixers" it creates once at startup; the game's own audio rebuild destroyed them and never made them
+    again, so sound-driven rumble stopped at the first switch. They are now handed back and made again with the
+    game's own functions at every switch.
 ------------
+
+Version 1.0.7
+Fixed controller vibration stopping after an audio switch: the game's two sound-rumble mixers, which its audio rebuild destroyed, are now made again at every switch.
 
 Version 1.0.6
 Fixed the Log level help on the settings page naming the old log file; it now names AutoAudioOutputSwitch.log in all eleven languages.
