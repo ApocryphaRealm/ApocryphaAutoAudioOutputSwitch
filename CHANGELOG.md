@@ -21,6 +21,17 @@
 - The DevBench state (`aaos.control`, every op) has a `rumble` block: whether the fix is active, the two mixers' slots,
   whether each level pointer points at a live mixer, the current levels, and how many times the mixers were handed back
   and made again. The log has one line per switch saying where the mixers were made again and whether both are live.
+- **Every vibration the game sends to the controller is recorded** (2026-10-23), so the fix can be checked from the log
+  with the player's own pad and nobody holding it. XInput cannot be read back, so the record is taken where the game
+  sends it: the game's own XInputSetState import (XINPUT1_3.dll, ordinal 3 on SE 1.5.97, AE 1.6.1170 and 1.7.104; the
+  game's only two callers are its rumble update and rumble stop) passes every call on unchanged and keeps the motor
+  values, the result (0 = a pad on that slot) and the time. This mod still links no XInput DLL. A "burst" is a run of
+  non-zero sends ending after 200 ms of zero sends; the log has one line per burst (the first 500 in a session) with
+  its length, peak motor values, the peak sound-rumble level while it ran ("from sound" or "timed") and how many
+  switches came before it, plus one line per switch counting what the motors were sent since the previous switch.
+  DevBench: every `aaos.control` reply has a `pad` block (calls, non-zero sends, the last motor values, whether the
+  import slot is still ours, since-switch and since-mark peaks, the last 8 bursts); `op=pad [mark=name]` returns the
+  last 32 bursts and starts a new since-mark count, logging the one it ends.
 
 ## 1.0.6 - 2026-10-11 - working
 

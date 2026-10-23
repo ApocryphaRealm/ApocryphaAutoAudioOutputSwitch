@@ -1857,6 +1857,268 @@ namespace audioswitch
 				EscapeJson(RumbleText()));
 		}
 
+		// ---- what the game sends to the controller's motors (1.0.7 observability, rule 31) ----
+		// XInput has no read-back, so the proof that rumble reaches the pad is taken where the game sends it: the game's own
+		// XInputSetState import (XINPUT1_3.dll, the DLL the game links; this mod links no XInput DLL) is pointed at a recorder
+		// that passes every call on unchanged and keeps the motor values, the result and the time. Steam Input's controller
+		// sits behind that call (it answers it in-process), so "result 0" means slot 0 has a pad. A burst is a run of
+		// non-zero sends; it ends after 200 ms of zero sends. Each burst records its peak motors and the peak level of the
+		// two rumble mixers while it ran (> 0 = rumble from sound, the kind a switch broke before 1.0.7; 0 = timed rumble).
+		struct PadVibration
+		{
+			std::uint16_t left;
+			std::uint16_t right;
+		};
+		using SetStateFn = DWORD(WINAPI*)(DWORD, PadVibration*);
+		SetStateFn g_origSetState = nullptr;
+		std::uintptr_t g_setStateSlot = 0;
+		std::string g_padInstall{ "not run" };  // written once in Install
+		std::atomic<std::uint64_t> g_padCalls{ 0 };
+		std::atomic<std::uint64_t> g_padNonZero{ 0 };
+		std::atomic<std::uint32_t> g_padLast{ 0 };              // left << 16 | right
+		std::atomic<std::uint32_t> g_padLastResult{ 0xFFFFFFFF };
+		std::atomic<std::uint32_t> g_padLastUser{ 0xFFFFFFFF };
+		std::atomic<std::int64_t> g_padLastNonZeroMs{ 0 };
+		std::atomic<bool> g_padFirstLogged{ false };
+
+		struct PadBurst
+		{
+			std::int64_t startMs{ 0 };
+			std::int64_t endMs{ 0 };     // 0 while it runs
+			std::uint16_t peakLeft{ 0 };
+			std::uint16_t peakRight{ 0 };
+			float peakSound{ 0.0f };     // the higher mixer level seen during the burst
+			std::uint32_t sends{ 0 };
+			std::uint32_t switchesBefore{ 0 };  // rumble mixer restores done when it started
+			DWORD result{ 0 };
+		};
+		struct PadSince
+		{
+			std::uint64_t sends{ 0 };
+			std::uint64_t nonZero{ 0 };
+			std::uint16_t peakLeft{ 0 };
+			std::uint16_t peakRight{ 0 };
+			float peakSound{ 0.0f };
+			std::uint32_t bursts{ 0 };
+			std::uint32_t soundBursts{ 0 };
+		};
+		std::mutex g_padLock;                 // guards everything below
+		PadBurst g_padOpen{};
+		bool g_padOpenValid = false;
+		std::vector<PadBurst> g_padBursts;    // the last 32 finished bursts
+		std::uint64_t g_padBurstTotal = 0;
+		PadSince g_padSinceSwitch{};
+		PadSince g_padSinceMark{};
+		std::string g_padMark{ "session start" };
+		std::int64_t g_padMarkMs = 0;
+
+		float SoundRumbleLevel()
+		{
+			if (!g_rumbleReady || g_rumblePending.load()) { return 0.0f; }
+			float best = 0.0f;
+			for (int i = 0; i < 2; ++i)
+			{
+				const float v = ReadLevelSafe(ReadPtr(reinterpret_cast<void*>(g_rumble.level[i]), 0));
+				if (v > best) { best = v; }
+			}
+			return best;
+		}
+
+		void PadAdd(PadSince& a_s, bool a_nonZero, std::uint16_t a_l, std::uint16_t a_r, float a_sound)
+		{
+			++a_s.sends;
+			if (!a_nonZero) { return; }
+			++a_s.nonZero;
+			a_s.peakLeft = (std::max)(a_s.peakLeft, a_l);
+			a_s.peakRight = (std::max)(a_s.peakRight, a_r);
+			a_s.peakSound = (std::max)(a_s.peakSound, a_sound);
+		}
+
+		void PadCloseBurst(std::int64_t a_now)  // g_padLock held
+		{
+			g_padOpen.endMs = a_now;
+			const bool sound = g_padOpen.peakSound > 0.0f;
+			++g_padSinceSwitch.bursts;
+			++g_padSinceMark.bursts;
+			if (sound)
+			{
+				++g_padSinceSwitch.soundBursts;
+				++g_padSinceMark.soundBursts;
+			}
+			++g_padBurstTotal;
+			if (g_padBursts.size() >= 32) { g_padBursts.erase(g_padBursts.begin()); }
+			g_padBursts.push_back(g_padOpen);
+			if (g_padBurstTotal <= 500)
+			{
+				logger::info("controller rumble: burst {} ended - {} ms, {} send(s), peak motors {}/{} (of 65535), sound rumble level peak {:.4f} ({}), {} switch(es) before it, XInputSetState result {}",
+					g_padBurstTotal, g_padOpen.endMs - g_padOpen.startMs, g_padOpen.sends, g_padOpen.peakLeft, g_padOpen.peakRight, g_padOpen.peakSound,
+					sound ? "from sound" : "timed", g_padOpen.switchesBefore, g_padOpen.result);
+				if (g_padBurstTotal == 500) { logger::info("controller rumble: 500 bursts logged; later ones are counted in DevBench aaos.control only"); }
+			}
+			g_padOpenValid = false;
+		}
+
+		void ReadVibrationSafe(const PadVibration* a_vib, std::uint16_t* a_l, std::uint16_t* a_r)  // POD only (SEH)
+		{
+			__try
+			{
+				if (a_vib)
+				{
+					*a_l = a_vib->left;
+					*a_r = a_vib->right;
+				}
+			}
+			__except (EXCEPTION_EXECUTE_HANDLER) {}
+		}
+
+		DWORD WINAPI HookSetState(DWORD a_user, PadVibration* a_vib)
+		{
+			const DWORD result = g_origSetState ? g_origSetState(a_user, a_vib) : ERROR_DEVICE_NOT_CONNECTED;
+			std::uint16_t l = 0;
+			std::uint16_t r = 0;
+			ReadVibrationSafe(a_vib, &l, &r);
+			++g_padCalls;
+			g_padLast = (static_cast<std::uint32_t>(l) << 16) | r;
+			g_padLastResult = result;
+			g_padLastUser = a_user;
+			if (!g_padFirstLogged.exchange(true))
+			{
+				logger::info("controller rumble: the game's first XInputSetState call - user {}, result {} ({})", a_user, result,
+					result == 0 ? "a pad is on that slot" : result == ERROR_DEVICE_NOT_CONNECTED ? "no pad on that slot" : "error");
+			}
+			const bool nonZero = l || r;
+			const std::int64_t now = NowMs();
+			const float sound = nonZero ? SoundRumbleLevel() : 0.0f;
+			if (nonZero)
+			{
+				++g_padNonZero;
+				g_padLastNonZeroMs = now;
+			}
+			std::scoped_lock lock(g_padLock);
+			PadAdd(g_padSinceSwitch, nonZero, l, r, sound);
+			PadAdd(g_padSinceMark, nonZero, l, r, sound);
+			if (nonZero)
+			{
+				if (!g_padOpenValid)
+				{
+					g_padOpen = PadBurst{};
+					g_padOpen.startMs = now;
+					g_padOpen.switchesBefore = g_rumbleRestores.load();
+					g_padOpenValid = true;
+				}
+				++g_padOpen.sends;
+				g_padOpen.peakLeft = (std::max)(g_padOpen.peakLeft, l);
+				g_padOpen.peakRight = (std::max)(g_padOpen.peakRight, r);
+				g_padOpen.peakSound = (std::max)(g_padOpen.peakSound, sound);
+				g_padOpen.result = result;
+			}
+			else if (g_padOpenValid && now - g_padLastNonZeroMs.load() >= 200)
+			{
+				PadCloseBurst(now);
+			}
+			return result;
+		}
+
+		std::uintptr_t FindImportSlotOrdinal(const char* a_dll, std::uint16_t a_ordinal)
+		{
+			const std::uintptr_t base = REL::Module::get().base();
+			__try
+			{
+				auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
+				auto* nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
+				const IMAGE_DATA_DIRECTORY& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+				if (!dir.VirtualAddress) { return 0; }
+				for (auto* d = reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR*>(base + dir.VirtualAddress); d->Name; ++d)
+				{
+					if (_stricmp(reinterpret_cast<const char*>(base + d->Name), a_dll) != 0 || !d->OriginalFirstThunk) { continue; }
+					auto* names = reinterpret_cast<IMAGE_THUNK_DATA64*>(base + d->OriginalFirstThunk);
+					auto* iat = reinterpret_cast<IMAGE_THUNK_DATA64*>(base + d->FirstThunk);
+					for (; names->u1.AddressOfData; ++names, ++iat)
+					{
+						if (IMAGE_SNAP_BY_ORDINAL64(names->u1.Ordinal) && IMAGE_ORDINAL64(names->u1.Ordinal) == a_ordinal) { return reinterpret_cast<std::uintptr_t>(iat); }
+					}
+				}
+			}
+			__except (EXCEPTION_EXECUTE_HANDLER) {}
+			return 0;
+		}
+
+		void InstallPadWatch()
+		{
+			std::uintptr_t slot = FindImportSlot("XINPUT1_3.dll", "XInputSetState");
+			if (!slot) { slot = FindImportSlotOrdinal("XINPUT1_3.dll", 3); }  // ordinal 3 is XInputSetState
+			if (!slot)
+			{
+				g_padInstall = "not active: the game's XInputSetState import (XINPUT1_3.dll) was not found; rumble sends are not recorded";
+				logger::warn("controller rumble: {}", g_padInstall);
+				return;
+			}
+			DWORD old = 0;
+			if (!VirtualProtect(reinterpret_cast<void*>(slot), sizeof(void*), PAGE_READWRITE, &old))
+			{
+				g_padInstall = std::format("not active: the import slot could not be made writable (error {})", GetLastError());
+				logger::warn("controller rumble: {}", g_padInstall);
+				return;
+			}
+			g_origSetState = *reinterpret_cast<SetStateFn*>(slot);
+			*reinterpret_cast<void**>(slot) = reinterpret_cast<void*>(&HookSetState);
+			VirtualProtect(reinterpret_cast<void*>(slot), sizeof(void*), old, &old);
+			g_setStateSlot = slot;
+			g_padInstall = std::format("active: the game's XInputSetState import at +0x{:X} (was {}) records every motor value it sends", slot - REL::Module::get().base(), Ptr(reinterpret_cast<void*>(g_origSetState)));
+			logger::info("controller rumble: {}", g_padInstall);
+		}
+
+		bool PadSlotIntact()
+		{
+			if (!g_setStateSlot) { return false; }
+			return ReadPtr(reinterpret_cast<void*>(g_setStateSlot), 0) == reinterpret_cast<void*>(&HookSetState);
+		}
+
+		std::string PadSinceJson(const PadSince& a_s)
+		{
+			return std::format(R"({{"sends":{},"nonZero":{},"peakLeft":{},"peakRight":{},"peakSoundLevel":{:.4f},"bursts":{},"soundBursts":{}}})", a_s.sends, a_s.nonZero,
+				a_s.peakLeft, a_s.peakRight, a_s.peakSound, a_s.bursts, a_s.soundBursts);
+		}
+
+		std::string PadBurstJson(const PadBurst& a_b, std::int64_t a_now)
+		{
+			return std::format(R"({{"agoMs":{},"durationMs":{},"sends":{},"peakLeft":{},"peakRight":{},"peakSoundLevel":{:.4f},"kind":"{}","switchesBefore":{},"result":{},"running":{}}})",
+				a_now - a_b.startMs, (a_b.endMs ? a_b.endMs : a_now) - a_b.startMs, a_b.sends, a_b.peakLeft, a_b.peakRight, a_b.peakSound,
+				a_b.peakSound > 0.0f ? "sound" : "timed", a_b.switchesBefore, a_b.result, a_b.endMs ? "false" : "true");
+		}
+
+		// a_bursts: how many of the latest finished bursts to include
+		std::string PadJson(std::size_t a_bursts)
+		{
+			const std::int64_t now = NowMs();
+			const std::uint32_t last = g_padLast.load();
+			const std::int64_t lastNz = g_padLastNonZeroMs.load();
+			std::scoped_lock lock(g_padLock);
+			std::string bursts;
+			if (g_padOpenValid) { bursts = PadBurstJson(g_padOpen, now); }
+			const std::size_t n = (std::min)(a_bursts, g_padBursts.size());
+			for (std::size_t i = 0; i < n; ++i)
+			{
+				if (!bursts.empty()) { bursts += ","; }
+				bursts += PadBurstJson(g_padBursts[g_padBursts.size() - 1 - i], now);
+			}
+			return std::format(
+				R"("pad":{{"install":"{}","slotIntact":{},"calls":{},"nonZeroSends":{},"lastLeft":{},"lastRight":{},"motorsOn":{},"lastResult":{},"lastUser":{},"msSinceNonZero":{},"burstsTotal":{},"sinceSwitch":{},"mark":"{}","sinceMarkMs":{},"sinceMark":{},"bursts":[{}]}})",
+				EscapeJson(g_padInstall), PadSlotIntact() ? "true" : "false", g_padCalls.load(), g_padNonZero.load(), last >> 16, last & 0xFFFF, last ? "true" : "false",
+				static_cast<std::int32_t>(g_padLastResult.load()), static_cast<std::int32_t>(g_padLastUser.load()), lastNz ? now - lastNz : -1, g_padBurstTotal,
+				PadSinceJson(g_padSinceSwitch), EscapeJson(g_padMark), now - g_padMarkMs, PadSinceJson(g_padSinceMark), bursts);
+		}
+
+		// Audio thread, at the end of every successful switch: log what the motors were sent since the previous one.
+		void PadNoteSwitch()
+		{
+			std::scoped_lock lock(g_padLock);
+			logger::info("controller rumble since the previous switch: {} send(s), {} non-zero, peak motors {}/{}, sound rumble level peak {:.4f}, {} burst(s) ({} from sound); slot {}",
+				g_padSinceSwitch.sends, g_padSinceSwitch.nonZero, g_padSinceSwitch.peakLeft, g_padSinceSwitch.peakRight, g_padSinceSwitch.peakSound, g_padSinceSwitch.bursts,
+				g_padSinceSwitch.soundBursts, PadSlotIntact() ? "intact" : (g_setStateSlot ? "REPLACED by another module - sends are no longer recorded" : "not hooked"));
+			g_padSinceSwitch = PadSince{};
+		}
+
 		// ---- the switch, on the game's audio thread ----
 		void FinishSwap()
 		{
@@ -2025,6 +2287,7 @@ namespace audioswitch
 			}
 			// 3b. the controller's sound-rumble mixers on the new engine, before the sounds that send to them come back
 			RestoreRumbleMixers(audio);
+			PadNoteSwitch();
 			g_swapStep = 5;
 			// 4. the game's own per-sound voice setup rebuilds every surviving sound on the new engine
 			int revived = 0;
@@ -2618,6 +2881,7 @@ namespace audioswitch
 					 g_addr.threadLoop, g_addr.processSounds, g_addr.setupSound, g_addr.voiceListA, g_addr.voiceListB, g_addr.audioObject, g_addr.audioVtable);
 		InstallVoiceGuard();
 		InstallRumble();
+		InstallPadWatch();
 		CheckEngineCreateCall();
 		logger::info("the game's engine-creation call at load: {}", g_createCallState);
 
@@ -2803,7 +3067,21 @@ namespace audioswitch
 			g_initializeCalls.load(), g_deviceCountCalls.load(), EscapeJson(g_voiceGuardResult), g_nullEngineSkips.load(), g_heldCount.load(), g_pinnedEngines.size(), g_retiredCount.load(), g_refusedCalls.load(), g_unserialisedCalls.load(), EscapeJson(g_createCallState), OtherModEngineText(), EscapeJson(g_leapGuardResult), g_leapCollisions.load(), EscapeJson(g_watcherResult), g_pending ? "true" : "false", g_busy ? "true" : "false",
 			g_swapPending.load() ? "true" : "false", g_requests, g_runs, EscapeJson(g_lastReason), Ptr(snap.audio), Ptr(snap.engine), Ptr(snap.master),
 			snap.master ? "true" : "false", EscapeJson(snap.deviceName), EscapeJson(snap.deviceId), snap.channels, snap.rate, g_passes.load(),
-			g_critical.load() ? "true" : "false", g_criticalCount.load(), snap.switches, snap.failures, EscapeJson(snap.lastResult)) + "," + RumbleJson();
+			g_critical.load() ? "true" : "false", g_criticalCount.load(), snap.switches, snap.failures, EscapeJson(snap.lastResult)) + "," + RumbleJson() + "," + PadJson(8);
+	}
+
+	std::string PadStateJson(std::string_view a_mark)
+	{
+		if (!a_mark.empty())
+		{
+			std::scoped_lock lock(g_padLock);
+			logger::info("controller rumble: mark \"{}\" - since the previous mark \"{}\": {} send(s), {} non-zero, peak motors {}/{}, {} burst(s) ({} from sound)", a_mark, g_padMark,
+				g_padSinceMark.sends, g_padSinceMark.nonZero, g_padSinceMark.peakLeft, g_padSinceMark.peakRight, g_padSinceMark.bursts, g_padSinceMark.soundBursts);
+			g_padSinceMark = PadSince{};
+			g_padMark = std::string(a_mark);
+			g_padMarkMs = NowMs();
+		}
+		return PadJson(32);
 	}
 
 	std::string DevicesJson()

@@ -105,6 +105,11 @@ namespace DevBenchTool
 				a_write(a_sink, StateReply("failinit", idle, idle ? "" : ",\"error\":\"the worker did not finish within 10 s\"").c_str());
 				return;
 			}
+			if (op == "pad")
+			{
+				a_write(a_sink, std::format("{{\"ok\":true,\"op\":\"pad\",{}}}", audioswitch::PadStateJson(Get(args, "mark"))).c_str());
+				return;
+			}
 			if (op == "foreigncall")
 			{
 				a_write(a_sink, std::format("{{\"ok\":true,\"op\":\"foreigncall\",{}}}", audioswitch::ForeignCallTest()).c_str());
@@ -209,9 +214,9 @@ namespace DevBenchTool
 			"XAudio2 engine (device, attached, processing passes, critical errors, resets, last result). op=devices: the XAudio2 device list "
 			"and the Windows render endpoints with state and default. op=check runs a reset check now (switches only if needed); op=reset "
 			"forces a switch to the target device. op=prefer name=\\\"...\\\" sets the preferred device (part of a name, a full id, or empty) "
-			"and checks. op=set with enabled / switchOnDefaultChange / switchToNewDevice / resetDelayMs, or mediaKeys / disableWindowsKey / disableDeadKeys (saved; the keyboard ones apply at the next game start - state reports mediaKeys status). op=volume [level=0-100] [mute=true|false]: read or set the Windows volume and mute of the device the game plays on. op=reload re-reads the INI and checks. op=failinit (test): forces a switch whose engine initialisation fails on purpose, leaving the game with no audio engine - state hooks.soundsSkippedNoEngine counts sounds skipped instead of crashing, and a switch is retried every 5 s. op=foreigncall (test): keeps the live engine's pointer the way Dragonborn ReVoiced does, forces a switch, then calls CreateSourceVoice on the kept pointer and on the new engine from another thread - hrKept is 0x88960001 (refused) on a retired engine, hrLive 0x00000000.\","
+			"and checks. op=set with enabled / switchOnDefaultChange / switchToNewDevice / resetDelayMs, or mediaKeys / disableWindowsKey / disableDeadKeys (saved; the keyboard ones apply at the next game start - state reports mediaKeys status). op=volume [level=0-100] [mute=true|false]: read or set the Windows volume and mute of the device the game plays on. op=reload re-reads the INI and checks. op=failinit (test): forces a switch whose engine initialisation fails on purpose, leaving the game with no audio engine - state hooks.soundsSkippedNoEngine counts sounds skipped instead of crashing, and a switch is retried every 5 s. op=foreigncall (test): keeps the live engine's pointer the way Dragonborn ReVoiced does, forces a switch, then calls CreateSourceVoice on the kept pointer and on the new engine from another thread - hrKept is 0x88960001 (refused) on a retired engine, hrLive 0x00000000. op=pad [mark=\\\"name\\\"]: every motor value the game sends to the controller through its XInputSetState import (calls, non-zero sends, last motors, result 0 = a pad on slot 0, sinceSwitch and sinceMark peaks, the last 32 bursts with kind sound or timed); mark starts a new since-mark count. Every reply's state has the same pad block with 8 bursts.\","
 			"\"inputSchema\":{\"type\":\"object\",\"properties\":{\"op\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"},"
-			"\"enabled\":{\"type\":\"boolean\"},\"switchOnDefaultChange\":{\"type\":\"boolean\"},\"switchToNewDevice\":{\"type\":\"boolean\"},\"mediaKeys\":{\"type\":\"boolean\"},\"disableWindowsKey\":{\"type\":\"boolean\"},\"disableDeadKeys\":{\"type\":\"boolean\"},\"level\":{\"type\":\"number\"},\"mute\":{\"type\":\"boolean\"},\"resetDelayMs\":{\"type\":\"integer\"}}},"
+			"\"enabled\":{\"type\":\"boolean\"},\"switchOnDefaultChange\":{\"type\":\"boolean\"},\"switchToNewDevice\":{\"type\":\"boolean\"},\"mediaKeys\":{\"type\":\"boolean\"},\"disableWindowsKey\":{\"type\":\"boolean\"},\"disableDeadKeys\":{\"type\":\"boolean\"},\"level\":{\"type\":\"number\"},\"mute\":{\"type\":\"boolean\"},\"mark\":{\"type\":\"string\"},\"resetDelayMs\":{\"type\":\"integer\"}}},"
 			"\"readOnly\":false"
 			"}";
 

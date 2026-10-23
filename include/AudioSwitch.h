@@ -56,6 +56,9 @@ namespace audioswitch
 	void FailNextEngineInit();
 	std::string ForeignCallTest();                    // DevBench op=foreigncall: another mod's call on an engine kept across a switch
 	std::string StateJson();                          // engines, hooks, counters
+	// DevBench op=pad: every motor value the game sent to the controller (its XInputSetState import), the last 32 bursts;
+	// a non-empty a_mark starts a new "since mark" count under that name (and logs the count it ends).
+	std::string PadStateJson(std::string_view a_mark);
 	std::string DevicesJson();                        // XAudio2 device list (from a live engine) and Windows endpoints
 	void LogSummary(std::string_view a_when);
 }
