@@ -44,10 +44,13 @@ WHAT CHANGED IN 1.0.7
     "rumble mixers" it creates once at startup; the game's own audio rebuild destroyed them and never made them
     again, so sound-driven rumble stopped at the first switch. They are now handed back and made again with the
     game's own functions at every switch.
+  - Fixed a crash to desktop after a switch that could not keep every playing sound - most often a Bluetooth
+    headset connected while the game was starting. Sounds are now taken out of the game's sound list without
+    breaking it.
 ------------
 
 Version 1.0.7
-Fixed controller vibration stopping after an audio switch: the game's two sound-rumble mixers, which its audio rebuild destroyed, are now made again at every switch.
+Fixed controller vibration stopping after an audio switch: the game's two sound-rumble mixers, which its audio rebuild destroyed, are now made again at every switch. Fixed a crash to desktop after a switch that had to drop sounds (often a Bluetooth headset connecting while the game starts).
 
 Version 1.0.6
 Fixed the Log level help on the settings page naming the old log file; it now names AutoAudioOutputSwitch.log in all eleven languages.

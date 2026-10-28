@@ -12,6 +12,12 @@
 // keys - the Apocrypha Menu Framework feeds the RIGHT stick of a held slider into those) and the left mouse button is
 // not. A mouse drag and a number typed into the slider (no arrow is down while typing) are left alone; held, the nudge
 // repeats as ImGui repeats it, one unit at a time.
+//
+// 1.7.5 (test d844): every slider is drawn with ImGuiSliderFlags_AlwaysClamp, so a number typed into it (Ctrl+click) is
+// clamped to the slider's range INSIDE ImGui. Without the flag ImGui 1.90.8 leaves a typed value unclamped, and while
+// the text field is open it copies the typed text back over the value every frame the two differ - a caller that
+// clamped the value itself (DEM's Scale against its runtime cap) got a 'changed' slider every frame, and the
+// minimap was re-applied at frame rate until Skyrim died in Scaleform.
 // ============================================================================================================
 
 #include "SKSEMenuFramework.h"
@@ -50,9 +56,10 @@ namespace precise
 	inline bool SliderFloat(const char* a_label, float* a_v, float a_min, float a_max, const char* a_format)
 	{
 		const float before = *a_v;
-		if (!ImGuiMCP::SliderFloat(a_label, a_v, a_min, a_max, a_format, 0)) {
+		if (!ImGuiMCP::SliderFloat(a_label, a_v, a_min, a_max, a_format, ImGuiMCP::ImGuiSliderFlags_AlwaysClamp)) {
 			return false;
 		}
+		*a_v = std::clamp(*a_v, a_min, a_max);   // the typed value stays inside the range whatever the framework's ImGui does
 		if (*a_v != before && Nudging()) {
 			const double step = Step(a_format);
 			double v = static_cast<double>(before) + (*a_v > before ? step : -step);
@@ -65,9 +72,10 @@ namespace precise
 	inline bool SliderInt(const char* a_label, int* a_v, int a_min, int a_max, const char* a_format = "%d")
 	{
 		const int before = *a_v;
-		if (!ImGuiMCP::SliderInt(a_label, a_v, a_min, a_max, a_format, 0)) {
+		if (!ImGuiMCP::SliderInt(a_label, a_v, a_min, a_max, a_format, ImGuiMCP::ImGuiSliderFlags_AlwaysClamp)) {
 			return false;
 		}
+		*a_v = std::clamp(*a_v, a_min, a_max);
 		if (*a_v != before && Nudging()) {
 			*a_v = std::clamp(before + (*a_v > before ? 1 : -1), a_min, a_max);
 		}

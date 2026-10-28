@@ -3,6 +3,18 @@
 ## 1.0.7 - 2026-10-16 - untested
 
 ### Fixed
+- **A crash to desktop after a switch that had to drop sounds** (Nexus, 2026-10-26: *"Turning on the Bluetooth
+  connection of the audio device during the game startup process can easily lead to a crash-to-desktop"*; SE 1.5.97,
+  1.0.6, `SkyrimSE.exe+0BF57E3` - 66492+0xF3 `cmp [rcx+0x10], rbx` with RCX 0, under the game's sound command dispatcher
+  66462, called through this mod's sound-processing hook on the audio thread). When a switch cannot give every playing
+  sound a voice on the new device (a Bluetooth headset that has only just connected is the usual case), the mod takes
+  those sounds out of the game's sound table. It did that by blanking their slots, which cut the table's internal
+  chains; the next sound the game started that had to walk such a chain followed the cut link and crashed. Sounds are
+  now taken out the way the table itself takes them out (the following entry moves up, or the chain is closed at the
+  previous one, and the free count is kept right), and the log checks every chain after each removal ("every chain
+  intact", or an error naming how many links are broken).
+- The Volume and Switch delay sliders clamp a typed value (Ctrl+click) to their range inside ImGui as well as after it,
+  so a number typed past the end can no longer be re-applied every frame while the field is open.
 - **Controller vibration stopped after an audio switch** (SHD156, Nexus, 2026-09-19: *"Switching audio in the game will
   cause the controller's vibration to stop working"*; Burugromalog, 2026-10-15). Skyrim makes much of its rumble from
   sound: a sound with a rumble send is also played into one of two "rumble mixers" (a submix voice with a level meter),

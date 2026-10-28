@@ -43,6 +43,9 @@ namespace audioswitch
 		// ---- game layout (identical on 1.5.97 and 1.7.104 in the disassembly) ----
 		constexpr std::uintptr_t kAudioMasterOff = 0x58;   // BSXAudio2Audio: IXAudio2MasteringVoice*
 		constexpr std::uintptr_t kSoundVoiceOff = 0x128;   // BSXAudio2GameSound: its source voice
+		constexpr std::uintptr_t kMgrMap = 0x30;           // BSAudioManager sound table (a BSTScatterTable) - SE 66462 passes mgr+0x30
+		constexpr std::uintptr_t kMapFreeCount = 0x08;     // table: free slot count (the insert's free-slot search decrements it)
+		constexpr std::uintptr_t kMapSentinel = 0x10;      // table: the chain-end sentinel every last entry's next points at
 		constexpr std::uintptr_t kMgrMapCapacity = 0x34;   // BSAudioManager sound table: slot count
 		constexpr std::uintptr_t kMgrMapEntries = 0x50;    // BSAudioManager sound table: entry array
 		constexpr std::uintptr_t kEntryStride = 0x18;      // {key, sound* @+8, next @+0x10}; empty when next == 0
@@ -247,31 +250,127 @@ namespace audioswitch
 			return n;
 		}
 
+		// Erases one occupied entry from the game's sound table the way the table itself does (a BSTScatterTable: entries
+		// {key, value, next}, chains end at the table's sentinel, an empty slot has next == 0, the free count at +0x08).
+		// 1.0.6 and earlier only zeroed the entry's next, which cut every chain running through it: the game's next insert
+		// that had to walk such a chain followed the zero and crashed (SE 66492+0xF3, `cmp [rcx+0x10], rbx` with RCX 0, under
+		// the command dispatcher 66462 - a Nexus crash log, 2026-10-26, a Bluetooth headset connected while the game started).
+		// A successor is moved into the erased slot (its one predecessor keeps pointing at that slot); the last entry of a
+		// chain is unlinked from its predecessor instead. Either way exactly one slot ends empty and the free count grows by one.
+		bool EraseSoundEntry(std::uint8_t* a_entries, std::uint32_t a_capacity, std::uint8_t* a_table, std::uint8_t* a_e)
+		{
+			void* const sentinel = *reinterpret_cast<void**>(a_table + kMapSentinel);
+			if (!sentinel) { return false; }
+			auto next = [](std::uint8_t* a_slot) -> std::uint8_t*& { return *reinterpret_cast<std::uint8_t**>(a_slot + 0x10); };
+			auto clear = [](std::uint8_t* a_slot) {
+				*reinterpret_cast<std::uint32_t*>(a_slot) = 0;
+				*reinterpret_cast<void**>(a_slot + 0x08) = nullptr;
+				*reinterpret_cast<void**>(a_slot + 0x10) = nullptr;
+			};
+			std::uint8_t* const succ = next(a_e);
+			if (succ == static_cast<std::uint8_t*>(sentinel))
+			{
+				for (std::uint32_t j = 0; j < a_capacity; ++j)
+				{
+					std::uint8_t* p = a_entries + static_cast<std::size_t>(j) * kEntryStride;
+					if (next(p) == a_e) { next(p) = static_cast<std::uint8_t*>(sentinel); }
+				}
+				clear(a_e);
+			}
+			else
+			{
+				const std::uintptr_t lo = reinterpret_cast<std::uintptr_t>(a_entries);
+				const std::uintptr_t hi = lo + static_cast<std::size_t>(a_capacity) * kEntryStride;
+				const std::uintptr_t at = reinterpret_cast<std::uintptr_t>(succ);
+				if (at < lo || at >= hi || (at - lo) % kEntryStride != 0) { return false; }   // not a slot of this table: leave it alone
+				*reinterpret_cast<std::uint32_t*>(a_e) = *reinterpret_cast<std::uint32_t*>(succ);
+				*reinterpret_cast<void**>(a_e + 0x08) = *reinterpret_cast<void**>(succ + 0x08);
+				next(a_e) = next(succ);
+				clear(succ);
+			}
+			++*reinterpret_cast<std::uint32_t*>(a_table + kMapFreeCount);
+			return true;
+		}
+
 		// Removes sounds from the table: every sound when a_onlyVoiceless is false, otherwise only sounds that have no
 		// source voice (so the game's per-sound update never dereferences a missing voice). Returns how many.
-		int RemoveSounds(void* a_mgr, bool a_onlyVoiceless)
+		int RemoveSoundsRaw(void* a_mgr, bool a_onlyVoiceless, int& refused)
 		{
 			int removed = 0;
 			__try
 			{
+				auto* table = static_cast<std::uint8_t*>(a_mgr) + kMgrMap;
 				const std::uint32_t capacity = *reinterpret_cast<std::uint32_t*>(static_cast<std::uint8_t*>(a_mgr) + kMgrMapCapacity);
 				auto* entries = *reinterpret_cast<std::uint8_t**>(static_cast<std::uint8_t*>(a_mgr) + kMgrMapEntries);
 				if (!entries || capacity == 0 || capacity > 0x10000) { return 0; }
 				for (std::uint32_t i = 0; i < capacity; ++i)
 				{
 					std::uint8_t* e = entries + static_cast<std::size_t>(i) * kEntryStride;
-					if (*reinterpret_cast<void**>(e + 0x10) == nullptr) { continue; }
-					void* s = *reinterpret_cast<void**>(e + 0x08);
-					const bool voiceless = !s || *reinterpret_cast<void**>(static_cast<std::uint8_t*>(s) + kSoundVoiceOff) == nullptr;
-					if (!a_onlyVoiceless || voiceless)
+					// An erase can move a successor into this slot, so the same slot is checked again until it is empty or kept.
+					for (int guard = 0; guard < 0x10000; ++guard)
 					{
-						*reinterpret_cast<void**>(e + 0x08) = nullptr;
-						*reinterpret_cast<void**>(e + 0x10) = nullptr;
+						if (*reinterpret_cast<void**>(e + 0x10) == nullptr) { break; }
+						void* s = *reinterpret_cast<void**>(e + 0x08);
+						const bool voiceless = !s || *reinterpret_cast<void**>(static_cast<std::uint8_t*>(s) + kSoundVoiceOff) == nullptr;
+						if (a_onlyVoiceless && !voiceless) { break; }
+						if (!EraseSoundEntry(entries, capacity, table, e))
+						{
+							++refused;
+							break;
+						}
 						++removed;
 					}
 				}
 			}
 			__except (EXCEPTION_EXECUTE_HANDLER) {}
+			return removed;
+		}
+
+		// Walks every chain of the sound table: a chain must reach the sentinel through occupied slots of the table.
+		// Returns the number of broken chains (a link to an empty slot, a null link, or a link outside the table), -1 if unreadable.
+		int SoundTableBrokenChains(void* a_mgr, int& a_occupied, std::uint32_t& a_free)
+		{
+			int broken = 0;
+			a_occupied = 0;
+			a_free = 0;
+			__try
+			{
+				auto* table = static_cast<std::uint8_t*>(a_mgr) + kMgrMap;
+				const std::uint32_t capacity = *reinterpret_cast<std::uint32_t*>(static_cast<std::uint8_t*>(a_mgr) + kMgrMapCapacity);
+				auto* entries = *reinterpret_cast<std::uint8_t**>(static_cast<std::uint8_t*>(a_mgr) + kMgrMapEntries);
+				void* const sentinel = *reinterpret_cast<void**>(table + kMapSentinel);
+				a_free = *reinterpret_cast<std::uint32_t*>(table + kMapFreeCount);
+				if (!entries || capacity == 0 || capacity > 0x10000) { return 0; }
+				const std::uintptr_t lo = reinterpret_cast<std::uintptr_t>(entries);
+				const std::uintptr_t hi = lo + static_cast<std::size_t>(capacity) * kEntryStride;
+				for (std::uint32_t i = 0; i < capacity; ++i)
+				{
+					std::uint8_t* e = entries + static_cast<std::size_t>(i) * kEntryStride;
+					if (*reinterpret_cast<void**>(e + 0x10) == nullptr) { continue; }
+					++a_occupied;
+					std::uint8_t* n = *reinterpret_cast<std::uint8_t**>(e + 0x10);
+					if (n == sentinel) { continue; }
+					const std::uintptr_t at = reinterpret_cast<std::uintptr_t>(n);
+					if (at < lo || at >= hi || (at - lo) % kEntryStride != 0 || *reinterpret_cast<void**>(n + 0x10) == nullptr) { ++broken; }
+				}
+			}
+			__except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+			return broken;
+		}
+
+		int RemoveSounds(void* a_mgr, bool a_onlyVoiceless)
+		{
+			int refused = 0;
+			const int removed = RemoveSoundsRaw(a_mgr, a_onlyVoiceless, refused);
+			if (refused > 0) { logger::warn("{} sound table entr{} could not be erased safely and were left in place", refused, refused == 1 ? "y" : "ies"); }
+			if (removed > 0 || refused > 0)
+			{
+				int occupied = 0;
+				std::uint32_t freeSlots = 0;
+				const int broken = SoundTableBrokenChains(a_mgr, occupied, freeSlots);
+				if (broken == 0) { logger::info("sound table after removing {} sound(s): {} entries, {} free, every chain intact", removed, occupied, freeSlots); }
+				else { logger::error("sound table after removing {} sound(s): {} entries, {} free, {} BROKEN chain link(s)", removed, occupied, freeSlots, broken); }
+			}
 			return removed;
 		}
 
